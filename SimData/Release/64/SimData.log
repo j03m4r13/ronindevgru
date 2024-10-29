@@ -1,0 +1,11 @@
+﻿  SimData.cpp
+C:\Sims\Original\SimData\SimData.cpp(158,30): warning C4244: 'initializing': conversion from 'float' to 'int', possible loss of data
+C:\Sims\Original\SimData\SimData.cpp(169,25): warning C4305: '+=': truncation from 'double' to 'float'
+C:\Sims\Original\SimData\SimData.cpp(175,25): warning C4305: '-=': truncation from 'double' to 'float'
+C:\Sims\Original\SimData\SimData.cpp(255,24): warning C4305: 'initializing': truncation from 'double' to 'float'
+C:\Sims\Original\SimData\SimData.cpp(455,9): warning C4305: 'return': truncation from 'double' to 'float'
+  serial.lib(serial.obj) : MSIL .netmodule or module compiled with /GL found; restarting link with /LTCG; add /LTCG to the link command line to improve linker performance
+     Creating library .\Release\64\SimData.lib and object .\Release\64\SimData.exp
+  Generating code
+  Finished generating code
+  SimData.vcxproj -> C:\X-Plane 11\Resources\plugins\ASpec\64\win.xpl
