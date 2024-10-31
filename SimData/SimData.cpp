@@ -7,6 +7,7 @@
 #include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
 #include "XPLMMenus.h"
+#include "XPLMPlanes.h"
 #include <thread>
 #include <atomic>
 #include "serial.h"
@@ -16,18 +17,26 @@
 #define MANUAL_PILOT 1
 #define MANUAL_PILOT_2 0
 #define AUTO_PILOT 2
+#define TBM_TRIM_ON 2
+#define TBM_AP_ON 2
+#define TBM_AUTOPILOT_MODE_OFF 1
+#define TBM_AUTOPILOT_MODE_ON 2
+
 
  // Atomic flag to control thread execution
 std::atomic<bool> keepRunning(true), keepRunningForId(true);
 std::mutex mtx;  // Mutex to protect shared variable
 /* We keep our data ref globally since only one is used for the whole plugin. */
 static XPLMDataRef		gDataRef = NULL;
+static XPLMDataRef		gDataRefTBM = NULL;
 static std::string trimWheelValInStr;
 float prevTrimDown = 0.0f;
 float currTrimDown = 0.0f;
 int prevTrimUp = 0;
 int currTrimUp = 0;
 int prevAutoPilotMode = 0;
+int prevAPModeTBM = 0;
+int prevState = 0;
 bool hasSentZeroDown = false;
 bool hasSentZeroUp = false;
 static void	MyMenuHandlerCallback(
@@ -37,8 +46,10 @@ static void	MyMenuHandlerCallback(
 serial::Serial arduinoSerial;
 serial::Serial arduino;
 std::string thePort;
+std::string userAircraft;
 bool foundArduino = false;
 bool arduinoConnected = false;
+bool hasLoadedAircraftName = false;
 HANDLE hSerial;
 DCB dcbSerialParams = { 0 };
 COMMTIMEOUTS timeouts = { 0 };
@@ -73,9 +84,9 @@ std::string enumerate_ports()
 	{
 		serial::PortInfo device = *iter++;
 		std::ostringstream oss;
-		oss << "PORTS: " << device.port.c_str() << ": " << device.description.c_str() << " : " << device.hardware_id.c_str()  << std::endl;		
-		std::string rxData = oss.str();
-		XPLMDebugString(rxData.c_str());
+		//oss << "PORTS: " << device.port.c_str() << ": " << device.description.c_str() << " : " << device.hardware_id.c_str()  << std::endl;		
+		//std::string rxData = oss.str();
+		//XPLMDebugString(rxData.c_str());
 		if (device.hardware_id.find("VID_1A86&PID_7523&REV_0264") != std::string::npos ||
 			device.hardware_id.find("VID_2310&PID_8008") != std::string::npos ||
 			device.hardware_id.find("VID_2341&PID_8037") != std::string::npos ||
@@ -83,7 +94,7 @@ std::string enumerate_ports()
 			device.hardware_id.find("VID_2341&PID_8037") != std::string::npos) {
 
 			
-			oss << "Found Arduino Micro: " << device.port.c_str() << std::endl;
+			oss << "[RoninDevGru] Found Arduino Micro for the TrimWheel Module: " << device.port.c_str() << std::endl;
 			XPLMDebugString(oss.str().c_str());
 			return device.port;
 		}
@@ -102,56 +113,153 @@ void serialIdPollingThread() {
 	arduino.close();
 }
 
-std::string GetAircraftModel() {
-	// Find the DataRef for the aircraft model name
-	XPLMDataRef modelRef = XPLMFindDataRef("sim/aircraft/view/acf_descrip");
-	if (modelRef == nullptr) {
-		return "Unknown Model"; // DataRef not found or error
+std::string getFirstAircraftModel() {
+	char modelName[256];
+	char modelPath[512];
+
+	// Retrieve model name and path for the first aircraft (index 0)
+	XPLMGetNthAircraftModel(0, modelName, modelPath);
+	std::ostringstream oss;
+	oss << modelName;
+	std::string aircraft = oss.str();
+
+
+	return aircraft;
+}
+
+bool isInFlight() {
+	// DataRefs for simulator state
+	XPLMDataRef pausedRef = XPLMFindDataRef("sim/time/paused");
+	XPLMDataRef xPosRef = XPLMFindDataRef("sim/flightmodel/position/local_x");
+	XPLMDataRef yPosRef = XPLMFindDataRef("sim/flightmodel/position/local_y");
+	XPLMDataRef zPosRef = XPLMFindDataRef("sim/flightmodel/position/local_z");
+
+	if (pausedRef && xPosRef && yPosRef && zPosRef) {
+		int paused = XPLMGetDatai(pausedRef);
+		float xPos = XPLMGetDataf(xPosRef);
+		float yPos = XPLMGetDataf(yPosRef);
+		float zPos = XPLMGetDataf(zPosRef);
+
+		// If simulator is not paused and aircraft has valid position, assume flight is active
+		if (paused == 0 && (xPos != 0.0 || yPos != 0.0 || zPos != 0.0)) {
+			return true;
+		}
 	}
 
-	// Allocate a buffer to hold the model name (X-Plane model names are typically short)
-	char modelName[256]; // Adjust buffer size if needed
-	int maxLen = sizeof(modelName);
-
-	// Retrieve the model name string from the DataRef
-	XPLMGetDatab(modelRef, modelName, 0, maxLen);
-
-	// Return as a C++ string
-	return std::string(modelName);
+	return false;
 }
+
 
 // Thread function for polling and sending data via serial
 void serialPollingThread() {
 	while (keepRunning.load()) {
+		if (!hasLoadedAircraftName && isInFlight()) {
+			//XPLMDebugString("MODEL IS\n");
+			userAircraft = getFirstAircraftModel();
+			hasLoadedAircraftName = true;
+		}
 		//if (!arduinoConnected) continue;
+		// tbm900/actuators/ap/disc 
 		// sim/cockpit/autopilot/autopilot_mode = 2 else 1
+		//tbm900/switches/elec/ap_trims OFF = 0, AP OFF = 1, ON = 2
+		
 		try {
-			gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
-			if (gDataRef != NULL)
-			{
-				int autoPilotMode = XPLMGetDatai(gDataRef);
-
-				if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == MANUAL_PILOT || autoPilotMode == MANUAL_PILOT_2) {
-					std::ostringstream oss;
-					oss << "M" << std::endl;
-					std::string txData = oss.str();
-					arduinoSerial.write(txData.c_str());
-
+			if (hasLoadedAircraftName && userAircraft == "TBM900.acf") {
+				gDataRefTBM = XPLMFindDataRef("tbm900/switches/elec/ap_trims_raw");
+				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
+				int autoPilotMode = XPLMGetDatai(gDataRefTBM);
+				int apModeTBM = XPLMGetDatai(gDataRef);
+				int currentState = 0;
+				if (autoPilotMode == 0) {
+					currentState = 1;
 				}
-				else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == AUTO_PILOT) {
-					std::ostringstream oss;
-					oss << "A" << std::endl;
-					std::string txData = oss.str();
-					arduinoSerial.write(txData.c_str());
+				else if (autoPilotMode == 2) {
+					currentState = 2;
+				}
+				
+				if (apModeTBM == 2) {
+					currentState = 3;
+				}
+
+
+				if (arduinoSerial.isOpen()) {
+					if (currentState != prevState) {
+						if (currentState == 1) {
+							std::ostringstream oss;
+							oss << "N" << std::endl;
+							std::string txData = oss.str();
+							arduinoSerial.write(txData.c_str());
+						}
+						else if (currentState == 2) {
+							std::ostringstream oss;
+							oss << "M" << std::endl;
+							std::string txData = oss.str();
+							arduinoSerial.write(txData.c_str());
+						}
+						else if (currentState == 3) {
+							std::ostringstream oss;
+							oss << "A" << std::endl;
+							std::string txData = oss.str();
+							arduinoSerial.write(txData.c_str());
+						}
+					}
+				}
+				prevState = currentState;
+				//if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == MANUAL_PILOT_2 && apModeTBM == TBM_AUTOPILOT_MODE_OFF) {
+
+				//}
+				//else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == TBM_TRIM_ON && apModeTBM == TBM_AUTOPILOT_MODE_OFF) {
+
+				//}
+
+				//if (arduinoSerial.isOpen() && apModeTBM != prevAPModeTBM && apModeTBM == TBM_AUTOPILOT_MODE_ON && autoPilotMode == TBM_TRIM_ON) {
+
+				//}
+				//else if (arduinoSerial.isOpen() && apModeTBM != prevAPModeTBM && apModeTBM == TBM_AUTOPILOT_MODE_OFF && autoPilotMode == TBM_TRIM_ON) {
+				//	std::ostringstream oss;
+				//	oss << "M" << std::endl;
+				//	std::string txData = oss.str();
+				//	arduinoSerial.write(txData.c_str());
+				//}
+
+				//prevAPModeTBM = apModeTBM;
+				//prevAutoPilotMode = autoPilotMode;
+			}
+			else {
+				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
+				if (gDataRef != NULL)
+				{
+					int autoPilotMode = XPLMGetDatai(gDataRef);
+
+					if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == MANUAL_PILOT || autoPilotMode == MANUAL_PILOT_2) {
+
+						//NORMAL NON-TBM STUFF
+						std::ostringstream oss;
+						oss << "M" << std::endl;
+						std::string txData = oss.str();
+						arduinoSerial.write(txData.c_str());
+						
+
+					}
+					else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == AUTO_PILOT) {
+
+						//NORMAL NON-TBM STUFF
+						std::ostringstream oss;
+						oss << "A" << std::endl;
+						std::string txData = oss.str();
+						arduinoSerial.write(txData.c_str());
+			
+					}
+					else {
+						std::cerr << "Failed to send data to COM port" << std::endl;
+					}
+					prevAutoPilotMode = autoPilotMode;
 				}
 				else {
 					std::cerr << "Failed to send data to COM port" << std::endl;
 				}
-				prevAutoPilotMode = autoPilotMode;
 			}
-			else {
-				std::cerr << "Failed to send data to COM port" << std::endl;
-			}
+
 			if (arduinoSerial.isOpen()) {
 				if (arduinoSerial.available()) {
 					std::string receivedData = arduinoSerial.read(arduinoSerial.available());
@@ -160,19 +268,20 @@ void serialPollingThread() {
 					oss << "Received: " << receivedData << std::endl;
 					std::string rxData = oss.str();
 					//XPLMDebugString(rxData.c_str());
+					//tbm900/switches/elec/ap_trims OFF = 0, AP OFF = 1, ON = 2
 					gDataRef = XPLMFindDataRef("sim/cockpit2/controls/elevator_trim");
 					if (gDataRef != NULL)
 					{
 						std::ostringstream oss3;
 						float trimWheelValf = XPLMGetDataf(gDataRef);
 						if (receivedEncoderDirF == 1) {
-							trimWheelValf += 0.002;
+							trimWheelValf += 0.0025;
 							if (trimWheelValf > 1.0) {
 								trimWheelValf = 1.0;
 							}
 						}
 						else if (receivedEncoderDirF == -1) {
-							trimWheelValf -= 0.002;
+							trimWheelValf -= 0.0025;
 							if (trimWheelValf < -1.0) {
 								trimWheelValf = -1.0;
 							}
@@ -185,7 +294,7 @@ void serialPollingThread() {
 				}
 			}
 			else {
-				XPLMDebugString("Serial communication is CLOSED");
+				XPLMDebugString("[RoninDevGru] Serial communication is CLOSED");
 			}
 
 
@@ -222,14 +331,14 @@ void serialPollingThread() {
 		} 
 		catch (serial::IOException& e) {
 			std::ostringstream oss;
-			oss << "Error opening serial port: " << e.what() << std::endl;
+			oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
 			XPLMDebugString(oss.str().c_str());
 		}
 
 	}
 
 	std::ostringstream oss;
-	oss << "Serial communication thread exiting... "  << std::endl;
+	oss << "[RoninDevGru] Serial communication thread exiting... "  << std::endl;
 
 	XPLMDebugString(oss.str().c_str());
 }
@@ -249,7 +358,7 @@ bool initSerialPort(const std::string& portName, uint32_t baudrate) {
 			arduinoSerial.setRTS(false);
 			std::this_thread::sleep_for(std::chrono::milliseconds(3000));
 			std::ostringstream oss;
-			oss << "[ASpec] Set DTR AND RTS successful and Port INIT Opened: " << portName << std::endl;
+			oss << "[RoninDevGru] Set DTR AND RTS successful and Port INIT Opened: " << portName << std::endl;
 
 			XPLMDebugString(oss.str().c_str());
 			float trimWheelValf = 0.07;
@@ -262,7 +371,7 @@ bool initSerialPort(const std::string& portName, uint32_t baudrate) {
 	}
 	catch (serial::IOException& e) {
 		std::cerr << "Error opening serial port: " << e.what() << std::endl;
-		XPLMDebugString("Port ERROR: PORT ");
+		XPLMDebugString("[RoninDevGru] Port ERROR: PORT ");
 		return false;
 	}
 	return false;
@@ -287,7 +396,7 @@ PLUGIN_API int XPluginStart(
 		return 0; // Failed to find Arduino Micro, do not start plugin
 	}
 	
-	if (!initSerialPort(comPort, 115200)) {
+	if (!initSerialPort(comPort, 250000)) {
 		return 0; // Failed to initialize serial, do not start plugin
 	}
 	arduinoConnected = true;
@@ -308,7 +417,7 @@ PLUGIN_API int XPluginStart(
 	 * This menu item will contain a submenu for us. */
 	mySubMenuItem = XPLMAppendMenuItem(
 						XPLMFindPluginsMenu(),	/* Put in plugins menu */
-						"ASpec",				/* Item Title */
+						"RoninDevGru",				/* Item Title */
 						0,						/* Item Ref */
 						1);						/* Force English */
 	
@@ -336,7 +445,6 @@ PLUGIN_API int XPluginStart(
 	std::thread(serialPollingThread).detach();  // Detach the thread so it runs independently
 
 	gDataRef = XPLMFindDataRef("sim/cockpit2/controls/elevator_trim");
-
 
 	/* Only return that we initialized correctly if we found the data ref. */
 	return (gDataRef != NULL) ? 1 : 0;
