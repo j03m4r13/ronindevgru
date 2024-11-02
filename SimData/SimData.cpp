@@ -17,10 +17,17 @@
 #define MANUAL_PILOT 1
 #define MANUAL_PILOT_2 0
 #define AUTO_PILOT 2
+#define YOKE_TRIM_MODE 3
 #define TBM_TRIM_ON 2
 #define TBM_AP_ON 2
 #define TBM_AUTOPILOT_MODE_OFF 1
 #define TBM_AUTOPILOT_MODE_ON 2
+
+#define TBM_STATE_TRIM_OFF 0
+#define TBM_STATE_TRIM_AP_OFF 1
+#define TBM_STATE_TRIM_ON 2
+#define TBM_STATE_AUTOPILOT_ON 3
+#define TBM_STATE_TRIM_ON_MANUAL_PITCH_ON 4
 
 
  // Atomic flag to control thread execution
@@ -29,6 +36,9 @@ std::mutex mtx;  // Mutex to protect shared variable
 /* We keep our data ref globally since only one is used for the whole plugin. */
 static XPLMDataRef		gDataRef = NULL;
 static XPLMDataRef		gDataRefTBM = NULL;
+static XPLMDataRef		gDataRefTBMPitchUpSwitch = NULL;
+static XPLMDataRef		gDataRefTBMPitchDownSwitch = NULL;
+
 static std::string trimWheelValInStr;
 float prevTrimDown = 0.0f;
 float currTrimDown = 0.0f;
@@ -37,8 +47,14 @@ int currTrimUp = 0;
 int prevAutoPilotMode = 0;
 int prevAPModeTBM = 0;
 int prevState = 0;
+int currentTBMTrimState = 0;
 bool hasSentZeroDown = false;
 bool hasSentZeroUp = false;
+
+bool pitchTrimUpActive = false;
+bool pitchTrimDownActive = false;
+
+
 static void	MyMenuHandlerCallback(
                                    void *               inMenuRef,    
                                    void *               inItemRef);    
@@ -162,74 +178,87 @@ void serialPollingThread() {
 		// tbm900/actuators/ap/disc 
 		// sim/cockpit/autopilot/autopilot_mode = 2 else 1
 		//tbm900/switches/elec/ap_trims OFF = 0, AP OFF = 1, ON = 2
-		
+		// sim/flight_controls/pitch_trim_down
+		// sim/flight_controls/pitch_trim_up
 		try {
 			if (hasLoadedAircraftName && userAircraft == "TBM900.acf") {
 				gDataRefTBM = XPLMFindDataRef("tbm900/switches/elec/ap_trims_raw");
 				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
-				int autoPilotMode = XPLMGetDatai(gDataRefTBM);
+
+				XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+				XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+	
+
+				int tbmTrimMode = XPLMGetDatai(gDataRefTBM);
 				int apModeTBM = XPLMGetDatai(gDataRef);
-				int currentState = 0;
-				if (autoPilotMode == 0) {
-					currentState = 1;
+				int currentState = -1;
+	
+				if (tbmTrimMode == TBM_STATE_TRIM_OFF) {
+					currentState = TBM_STATE_TRIM_OFF;
+					currentTBMTrimState = currentState; // save current state;
 				}
-				else if (autoPilotMode == 2) {
-					currentState = 2;
+				else if (tbmTrimMode == TBM_STATE_TRIM_ON) {
+					currentState = TBM_STATE_TRIM_ON;
+					currentTBMTrimState = currentState; // save current state;
 				}
 				
-				if (apModeTBM == 2) {
-					currentState = 3;
+				if (apModeTBM == TBM_AP_ON) {
+					currentState = TBM_STATE_AUTOPILOT_ON;
+					currentTBMTrimState = currentState; // save current state;
 				}
 
+				if (pitchTrimDownActive || pitchTrimUpActive) {
+					
+					currentState = TBM_STATE_TRIM_ON_MANUAL_PITCH_ON;
+
+				}
+				else {
+					currentState = currentTBMTrimState;
+				}
 
 				if (arduinoSerial.isOpen()) {
 					if (currentState != prevState) {
-						if (currentState == 1) {
+						std::ostringstream oss;
+						oss << "[RoninDevGru] STATE:" << currentState << std::endl;
+						XPLMDebugString(oss.str().c_str());
+						if (currentState == TBM_STATE_TRIM_OFF) {
 							std::ostringstream oss;
 							oss << "N" << std::endl;
 							std::string txData = oss.str();
 							arduinoSerial.write(txData.c_str());
 						}
-						else if (currentState == 2) {
+						else if (currentState == TBM_STATE_TRIM_ON) {
 							std::ostringstream oss;
 							oss << "M" << std::endl;
 							std::string txData = oss.str();
 							arduinoSerial.write(txData.c_str());
 						}
-						else if (currentState == 3) {
+						else if (currentState == TBM_STATE_AUTOPILOT_ON) {
 							std::ostringstream oss;
 							oss << "A" << std::endl;
 							std::string txData = oss.str();
 							arduinoSerial.write(txData.c_str());
 						}
+						else if (currentState == TBM_STATE_TRIM_ON_MANUAL_PITCH_ON) {
+							std::ostringstream oss;
+							oss << "O" << std::endl;
+							std::string txData = oss.str();
+							arduinoSerial.write(txData.c_str());
+						}
+						prevState = currentState;
 					}
 				}
-				prevState = currentState;
-				//if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == MANUAL_PILOT_2 && apModeTBM == TBM_AUTOPILOT_MODE_OFF) {
-
-				//}
-				//else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == TBM_TRIM_ON && apModeTBM == TBM_AUTOPILOT_MODE_OFF) {
-
-				//}
-
-				//if (arduinoSerial.isOpen() && apModeTBM != prevAPModeTBM && apModeTBM == TBM_AUTOPILOT_MODE_ON && autoPilotMode == TBM_TRIM_ON) {
-
-				//}
-				//else if (arduinoSerial.isOpen() && apModeTBM != prevAPModeTBM && apModeTBM == TBM_AUTOPILOT_MODE_OFF && autoPilotMode == TBM_TRIM_ON) {
-				//	std::ostringstream oss;
-				//	oss << "M" << std::endl;
-				//	std::string txData = oss.str();
-				//	arduinoSerial.write(txData.c_str());
-				//}
-
-				//prevAPModeTBM = apModeTBM;
-				//prevAutoPilotMode = autoPilotMode;
+				
 			}
 			else {
 				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
 				if (gDataRef != NULL)
 				{
 					int autoPilotMode = XPLMGetDatai(gDataRef);
+
+					if (pitchTrimDownActive || pitchTrimUpActive) {
+						autoPilotMode = YOKE_TRIM_MODE;
+					}
 
 					if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == MANUAL_PILOT || autoPilotMode == MANUAL_PILOT_2) {
 
@@ -249,6 +278,13 @@ void serialPollingThread() {
 						std::string txData = oss.str();
 						arduinoSerial.write(txData.c_str());
 			
+					}
+					else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == YOKE_TRIM_MODE) {
+
+						std::ostringstream oss;
+						oss << "O" << std::endl;
+						std::string txData = oss.str();
+						arduinoSerial.write(txData.c_str());
 					}
 					else {
 						std::cerr << "Failed to send data to COM port" << std::endl;
@@ -377,7 +413,31 @@ bool initSerialPort(const std::string& portName, uint32_t baudrate) {
 	return false;
 }
 
+// Command handler function
+int PitchTrimUpCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		pitchTrimUpActive = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		pitchTrimUpActive = false;
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
 
+// Command handler function
+int PitchTrimDownCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		pitchTrimDownActive = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		pitchTrimDownActive = false;
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
 
 PLUGIN_API int XPluginStart(
 						char *		outName,
@@ -446,6 +506,15 @@ PLUGIN_API int XPluginStart(
 
 	gDataRef = XPLMFindDataRef("sim/cockpit2/controls/elevator_trim");
 
+	XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+	if (pitchTrimUpCommand != nullptr) {
+		XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
+	}
+
+	XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+	if (pitchTrimDownCommand != nullptr) {
+		XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
+	}
 	/* Only return that we initialized correctly if we found the data ref. */
 	return (gDataRef != NULL) ? 1 : 0;
 }
@@ -465,6 +534,16 @@ PLUGIN_API void	XPluginStop(void)
 	// Stop the serial communication thread
 	if (arduino.isOpen()) {
 		arduino.close();
+	}
+	XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+	if (pitchTrimUpCommand != nullptr) {
+		// Unregister the command handler
+		XPLMUnregisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
+	}
+	XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+	if (pitchTrimDownCommand != nullptr) {
+		// Unregister the command handler
+		XPLMUnregisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
 	}
 	// Close serial port
 	if (arduinoSerial.isOpen()) {
