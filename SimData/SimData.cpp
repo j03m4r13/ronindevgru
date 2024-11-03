@@ -272,20 +272,24 @@ void serialPollingThread() {
 				if (tbmTrimMode == TBM_STATE_TRIM_OFF) {
 					currentState = TBM_STATE_TRIM_OFF;
 					currentTBMTrimState = currentState; // save current state;
+					//autoPilotDisconnected = false;
 				}
 				else if (tbmTrimMode == TBM_STATE_TRIM_ON) {
 					currentState = TBM_STATE_TRIM_ON;
 					currentTBMTrimState = currentState; // save current state;
+					//autoPilotDisconnected = false;
 				}
 				
 				if (apModeTBM == TBM_AP_ON) {
 					currentState = TBM_STATE_AUTOPILOT_ON;
 					currentTBMTrimState = currentState; // save current state;
+					autoPilotDisconnected = false;
 				}
 
 				if (pitchTrimDownActive || pitchTrimUpActive) {
 					
 					currentState = TBM_STATE_TRIM_ON_MANUAL_PITCH_ON;
+					//autoPilotDisconnected = false;
 
 				}
 				else {
@@ -362,6 +366,7 @@ void serialPollingThread() {
 						oss << "O" << std::endl;
 						std::string txData = oss.str();
 						arduinoSerial.write(txData.c_str());
+
 					}
 					else {
 						std::cerr << "Failed to send data to COM port" << std::endl;
@@ -403,11 +408,8 @@ void serialPollingThread() {
 							XPLMSetDataf(gDataRef, trimWheelValf);
 						}
 						else if (receivedEncoderDirF == 2) {
-
-							if (!autoPilotDisconnected) {
 								triggerAPDisc.store(true);
-								autoPilotDisconnected = true;
-							}
+							
 						}
 
 
