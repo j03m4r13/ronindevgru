@@ -38,6 +38,9 @@ static XPLMDataRef		gDataRef = NULL;
 static XPLMDataRef		gDataRefTBM = NULL;
 static XPLMDataRef		gDataRefTBMPitchUpSwitch = NULL;
 static XPLMDataRef		gDataRefTBMPitchDownSwitch = NULL;
+XPLMCommandRef pitchTrimUpCommand;
+XPLMCommandRef pitchTrimDownCommand;
+XPLMCommandRef autopilotDisconnectCommand;
 
 static std::string trimWheelValInStr;
 float prevTrimDown = 0.0f;
@@ -48,11 +51,14 @@ int prevAutoPilotMode = 0;
 int prevAPModeTBM = 0;
 int prevState = 0;
 int currentTBMTrimState = 0;
+int autoPilotModeNormal = 0;
+
 bool hasSentZeroDown = false;
 bool hasSentZeroUp = false;
 
 bool pitchTrimUpActive = false;
 bool pitchTrimDownActive = false;
+bool autoPilotDisconnected = false;
 
 
 static void	MyMenuHandlerCallback(
@@ -166,6 +172,45 @@ bool isInFlight() {
 }
 
 
+void ExecutePitchTrimUp() {
+	if (pitchTrimUpCommand != nullptr) {
+		// Begin the command (simulates pressing the button)
+		XPLMCommandOnce(pitchTrimUpCommand);
+
+		// Optionally, end the command immediately to simulate a quick press
+		//XPLMCommandEnd(pitchTrimUpCommand);
+	}
+	else {
+		// Handle error: command not found
+	}
+}
+void ExecutePitchTrimDown() {
+	if (pitchTrimDownCommand != nullptr) {
+		// Begin the command (simulates pressing the button)
+		XPLMCommandOnce(pitchTrimDownCommand);
+
+		//// Optionally, end the command immediately to simulate a quick press
+		//XPLMCommandEnd(pitchTrimDownCommand);
+	}
+	else {
+		// Handle error: command not found
+	}
+}
+
+void DisconnectAutopilot() {
+	if (autopilotDisconnectCommand != nullptr) {
+		// Trigger the disconnect command
+		XPLMCommandOnce(autopilotDisconnectCommand);
+	}
+	else {
+		// Handle error: command not found
+	}
+}
+void DisconnectAutopilotUsingKeyID() {
+	// Sends a command keystroke to disarm the autopilot
+	XPLMCommandKeyStroke(xplm_key_elvtrimU);
+}
+
 // Thread function for polling and sending data via serial
 void serialPollingThread() {
 	while (keepRunning.load()) {
@@ -173,6 +218,10 @@ void serialPollingThread() {
 			//XPLMDebugString("MODEL IS\n");
 			userAircraft = getFirstAircraftModel();
 			hasLoadedAircraftName = true;
+
+			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+			pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+			
 		}
 		//if (!arduinoConnected) continue;
 		// tbm900/actuators/ap/disc 
@@ -277,6 +326,7 @@ void serialPollingThread() {
 						oss << "A" << std::endl;
 						std::string txData = oss.str();
 						arduinoSerial.write(txData.c_str());
+						//autoPilotDisconnected = false;
 			
 					}
 					else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == YOKE_TRIM_MODE) {
@@ -315,16 +365,24 @@ void serialPollingThread() {
 							if (trimWheelValf > 1.0) {
 								trimWheelValf = 1.0;
 							}
+							XPLMSetDataf(gDataRef, trimWheelValf);
 						}
 						else if (receivedEncoderDirF == -1) {
+
 							trimWheelValf -= 0.0025;
 							if (trimWheelValf < -1.0) {
 								trimWheelValf = -1.0;
 							}
-
+							XPLMSetDataf(gDataRef, trimWheelValf);
 						}
-
-						XPLMSetDataf(gDataRef, trimWheelValf);
+						else if (receivedEncoderDirF == 2) {
+							if (!autoPilotDisconnected) {
+								DisconnectAutopilotUsingKeyID();
+								//ExecutePitchTrimUp();
+								autoPilotDisconnected = true;
+							}
+						}
+						
 
 					}
 				}
@@ -508,13 +566,16 @@ PLUGIN_API int XPluginStart(
 
 	XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 	if (pitchTrimUpCommand != nullptr) {
-		XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
+		//XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
 	}
 
 	XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
 	if (pitchTrimDownCommand != nullptr) {
-		XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
+		//XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
 	}
+
+	
+	autoPilotDisconnected = false;
 	/* Only return that we initialized correctly if we found the data ref. */
 	return (gDataRef != NULL) ? 1 : 0;
 }
