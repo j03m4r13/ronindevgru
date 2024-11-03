@@ -32,6 +32,7 @@
 
  // Atomic flag to control thread execution
 std::atomic<bool> keepRunning(true), keepRunningForId(true);
+std::atomic<bool> triggerAPDisc{ false };
 std::mutex mtx;  // Mutex to protect shared variable
 /* We keep our data ref globally since only one is used for the whole plugin. */
 static XPLMDataRef		gDataRef = NULL;
@@ -59,7 +60,7 @@ bool hasSentZeroUp = false;
 bool pitchTrimUpActive = false;
 bool pitchTrimDownActive = false;
 bool autoPilotDisconnected = false;
-
+bool triggerAP = false;
 
 static void	MyMenuHandlerCallback(
                                    void *               inMenuRef,    
@@ -173,7 +174,7 @@ bool isInFlight() {
 
 
 void ExecutePitchTrimUp() {
-	if (pitchTrimUpCommand != nullptr) {
+	if (pitchTrimUpCommand) {
 		// Begin the command (simulates pressing the button)
 		XPLMCommandOnce(pitchTrimUpCommand);
 
@@ -185,7 +186,7 @@ void ExecutePitchTrimUp() {
 	}
 }
 void ExecutePitchTrimDown() {
-	if (pitchTrimDownCommand != nullptr) {
+	if (pitchTrimDownCommand) {
 		// Begin the command (simulates pressing the button)
 		XPLMCommandOnce(pitchTrimDownCommand);
 
@@ -210,6 +211,31 @@ void DisconnectAutopilotUsingKeyID() {
 	// Sends a command keystroke to disarm the autopilot
 	XPLMCommandKeyStroke(xplm_key_elvtrimU);
 }
+void CommandThread() {
+	// Wait or perform calculations here
+
+	std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Example delay
+
+	// Set flag for main thread to pick up
+	triggerAPDisc.store(true);
+}
+
+float FlightLoopCallback(float inElapsedSinceLastCall, float inElapsedTimeSinceLastFlightLoop, int inCounter, void* inRefcon) {
+	if (triggerAPDisc.load()) {
+		// Execute pitch trim up command
+		if (autopilotDisconnectCommand != nullptr) {
+			// Trigger the disconnect command
+			XPLMCommandBegin(autopilotDisconnectCommand);
+			XPLMCommandEnd(autopilotDisconnectCommand);
+		}
+		else {
+			// Handle error: command not found
+		}
+		// Reset the flag
+		triggerAPDisc.store(false);
+	}
+	return -1.0f; // Return -1 to run every frame
+}
 
 // Thread function for polling and sending data via serial
 void serialPollingThread() {
@@ -221,6 +247,7 @@ void serialPollingThread() {
 
 			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 			pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+			autopilotDisconnectCommand = XPLMFindCommand("sim/autopilot/disconnect");
 			
 		}
 		//if (!arduinoConnected) continue;
@@ -326,7 +353,7 @@ void serialPollingThread() {
 						oss << "A" << std::endl;
 						std::string txData = oss.str();
 						arduinoSerial.write(txData.c_str());
-						//autoPilotDisconnected = false;
+						autoPilotDisconnected = false;
 			
 					}
 					else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == YOKE_TRIM_MODE) {
@@ -376,12 +403,14 @@ void serialPollingThread() {
 							XPLMSetDataf(gDataRef, trimWheelValf);
 						}
 						else if (receivedEncoderDirF == 2) {
+
 							if (!autoPilotDisconnected) {
-								DisconnectAutopilotUsingKeyID();
-								//ExecutePitchTrimUp();
+								triggerAPDisc.store(true);
 								autoPilotDisconnected = true;
 							}
 						}
+
+
 						
 
 					}
@@ -555,7 +584,7 @@ PLUGIN_API int XPluginStart(
 	//	1);
 	//XPLMAppendMenuItem(
 	//	myMenu,
-	//	"Receive Message",
+	//	"AP Disc",
 	//	(void*)+1000,
 	//	1);
 
@@ -566,15 +595,17 @@ PLUGIN_API int XPluginStart(
 
 	XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 	if (pitchTrimUpCommand != nullptr) {
-		//XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
+		XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
 	}
 
 	XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
 	if (pitchTrimDownCommand != nullptr) {
-		//XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
+		XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
 	}
+	pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+	XPLMRegisterFlightLoopCallback(FlightLoopCallback, -1.0f, nullptr);
 
-	
+
 	autoPilotDisconnected = false;
 	/* Only return that we initialized correctly if we found the data ref. */
 	return (gDataRef != NULL) ? 1 : 0;
@@ -592,10 +623,15 @@ PLUGIN_API void	XPluginStop(void)
 	}
     keepRunning.store(false);  // Signal the thread to stop
 	XPLMUnregisterFlightLoopCallback(MyFlightLoopCallback, NULL);
+	// Unregister the flight loop callback
+
+	XPLMUnregisterFlightLoopCallback(FlightLoopCallback, nullptr);
 	// Stop the serial communication thread
 	if (arduino.isOpen()) {
 		arduino.close();
 	}
+	
+
 	XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 	if (pitchTrimUpCommand != nullptr) {
 		// Unregister the command handler
@@ -669,9 +705,7 @@ void	MyMenuHandlerCallback(
 	/* This is our handler for the menu item.  Our inItemRef is the refcon
 	 * we registered in our XPLMAppendMenuItem calls.  It is either +1000 or
 	 * -1000 depending on which menu item is picked. */
-	if (arduinoSerial.isOpen()) {
-		arduinoSerial.write("Test");
-	}
+	ExecutePitchTrimUp();
 }                                   
 
 float	MyFlightLoopCallback(
