@@ -14,6 +14,9 @@
 #include <mutex>
 #include <vector>
 
+#define TW_PLUGIN 1
+#define FS_PLUGIN 2
+
 #define MANUAL_PILOT 1
 #define MANUAL_PILOT_2 0
 #define AUTO_PILOT 2
@@ -30,7 +33,7 @@
 #define TBM_STATE_TRIM_ON_MANUAL_PITCH_ON 4
 
 
- // Atomic flag to control thread execution
+// Atomic flag to control thread execution
 std::atomic<bool> keepRunning(true), keepRunningForId(true);
 std::atomic<bool> triggerAPDisc{ false };
 std::mutex mtx;  // Mutex to protect shared variable
@@ -63,8 +66,8 @@ bool autoPilotDisconnected = false;
 bool triggerAP = false;
 
 static void	MyMenuHandlerCallback(
-                                   void *               inMenuRef,    
-                                   void *               inItemRef);    
+	void* inMenuRef,
+	void* inItemRef);
 // Serial port object
 serial::Serial arduinoSerial;
 serial::Serial arduino;
@@ -97,7 +100,7 @@ std::vector<std::string> list_ports() {
 	return port_names;
 }
 
-std::string enumerate_ports()
+std::string enumerate_ports(int forPlugin = TW_PLUGIN)
 {
 	std::vector<serial::PortInfo> devices_found = serial::list_ports();
 
@@ -110,16 +113,37 @@ std::string enumerate_ports()
 		//oss << "PORTS: " << device.port.c_str() << ": " << device.description.c_str() << " : " << device.hardware_id.c_str()  << std::endl;		
 		//std::string rxData = oss.str();
 		//XPLMDebugString(rxData.c_str());
-		if (device.hardware_id.find("VID_1A86&PID_7523&REV_0264") != std::string::npos ||
-			device.hardware_id.find("VID_2310&PID_8008") != std::string::npos ||
-			device.hardware_id.find("VID_2341&PID_8037") != std::string::npos ||
-			device.hardware_id.find("VID_2341&PID_8036") != std::string::npos ||
-			device.hardware_id.find("VID_2341&PID_8037") != std::string::npos) {
+		if (forPlugin == TW_PLUGIN) {
+			if (device.hardware_id.find("VID_1A86&PID_7523&REV_0264") != std::string::npos ||
+				device.hardware_id.find("VID_2310&PID_8008") != std::string::npos ||
+				device.hardware_id.find("VID_2341&PID_8037") != std::string::npos ||
+				device.hardware_id.find("VID_2341&PID_8036") != std::string::npos ||
+				device.hardware_id.find("VID_2341&PID_8037") != std::string::npos ||
+				device.hardware_id.find("VID_4210&PID_6900") != std::string::npos ||
+				device.hardware_id.find("VID_2342&PID_3501") != std::string::npos ||
+				device.hardware_id.find("VID_4262PID_3500") != std::string::npos) {
 
-			
-			oss << "[RoninDevGru] Found Arduino Micro for the TrimWheel Module: " << device.port.c_str() << std::endl;
-			XPLMDebugString(oss.str().c_str());
-			return device.port;
+
+				oss << "[RoninDevGru] Found Arduino Micro for the TrimWheel Module: " << device.port.c_str() << std::endl;
+				XPLMDebugString(oss.str().c_str());
+				return device.port;
+			}
+		}
+		else {
+			if (device.hardware_id.find("VID_1A86&PID_7523&REV_0264") != std::string::npos ||
+				device.hardware_id.find("VID_2310&PID_8008") != std::string::npos ||
+				device.hardware_id.find("VID_2341&PID_8037") != std::string::npos ||
+				device.hardware_id.find("VID_2341&PID_8036") != std::string::npos ||
+				device.hardware_id.find("VID_2341&PID_8037") != std::string::npos ||
+				device.hardware_id.find("VID_4210&PID_6900") != std::string::npos ||
+				device.hardware_id.find("VID_2342&PID_3501") != std::string::npos ||
+				device.hardware_id.find("VID_4262PID_3500") != std::string::npos) {
+
+
+				oss << "[RoninDevGru] Found Arduino Micro for the TrimWheel Module: " << device.port.c_str() << std::endl;
+				XPLMDebugString(oss.str().c_str());
+				return device.port;
+			}
 		}
 
 	}
@@ -207,10 +231,12 @@ void DisconnectAutopilot() {
 		// Handle error: command not found
 	}
 }
+
 void DisconnectAutopilotUsingKeyID() {
 	// Sends a command keystroke to disarm the autopilot
 	XPLMCommandKeyStroke(xplm_key_elvtrimU);
 }
+
 void CommandThread() {
 	// Wait or perform calculations here
 
@@ -248,7 +274,7 @@ void serialPollingThread() {
 			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 			pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
 			autopilotDisconnectCommand = XPLMFindCommand("sim/autopilot/disconnect");
-			
+
 		}
 		//if (!arduinoConnected) continue;
 		// tbm900/actuators/ap/disc 
@@ -263,12 +289,12 @@ void serialPollingThread() {
 
 				XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 				XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
-	
+
 
 				int tbmTrimMode = XPLMGetDatai(gDataRefTBM);
 				int apModeTBM = XPLMGetDatai(gDataRef);
 				int currentState = -1;
-	
+
 				if (tbmTrimMode == TBM_STATE_TRIM_OFF) {
 					currentState = TBM_STATE_TRIM_OFF;
 					currentTBMTrimState = currentState; // save current state;
@@ -279,7 +305,7 @@ void serialPollingThread() {
 					currentTBMTrimState = currentState; // save current state;
 					//autoPilotDisconnected = false;
 				}
-				
+
 				if (apModeTBM == TBM_AP_ON) {
 					currentState = TBM_STATE_AUTOPILOT_ON;
 					currentTBMTrimState = currentState; // save current state;
@@ -287,7 +313,7 @@ void serialPollingThread() {
 				}
 
 				if (pitchTrimDownActive || pitchTrimUpActive) {
-					
+
 					currentState = TBM_STATE_TRIM_ON_MANUAL_PITCH_ON;
 					//autoPilotDisconnected = false;
 
@@ -328,7 +354,7 @@ void serialPollingThread() {
 						prevState = currentState;
 					}
 				}
-				
+
 			}
 			else {
 				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
@@ -347,7 +373,7 @@ void serialPollingThread() {
 						oss << "M" << std::endl;
 						std::string txData = oss.str();
 						arduinoSerial.write(txData.c_str());
-						
+
 
 					}
 					else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == AUTO_PILOT) {
@@ -358,7 +384,7 @@ void serialPollingThread() {
 						std::string txData = oss.str();
 						arduinoSerial.write(txData.c_str());
 						autoPilotDisconnected = false;
-			
+
 					}
 					else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == YOKE_TRIM_MODE) {
 
@@ -408,12 +434,12 @@ void serialPollingThread() {
 							XPLMSetDataf(gDataRef, trimWheelValf);
 						}
 						else if (receivedEncoderDirF == 2) {
-								triggerAPDisc.store(true);
-							
+							triggerAPDisc.store(true);
+
 						}
 
 
-						
+
 
 					}
 				}
@@ -438,6 +464,7 @@ void serialPollingThread() {
 						oss << trimWheelValf;
 						std::string trimWheelValInStr = oss.str();
 						trimWheelValInStr.append("\n");
+						XPLMDebugString(trimWheelValInStr.c_str());
 						arduinoSerial.write(trimWheelValInStr.c_str());
 
 					}
@@ -453,7 +480,7 @@ void serialPollingThread() {
 
 			// Sleep or wait a bit to avoid overwhelming the serial communication
 			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		} 
+		}
 		catch (serial::IOException& e) {
 			std::ostringstream oss;
 			oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
@@ -463,7 +490,7 @@ void serialPollingThread() {
 	}
 
 	std::ostringstream oss;
-	oss << "[RoninDevGru] Serial communication thread exiting... "  << std::endl;
+	oss << "[RoninDevGru] Serial communication thread exiting... " << std::endl;
 
 	XPLMDebugString(oss.str().c_str());
 }
@@ -529,12 +556,12 @@ int PitchTrimDownCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, 
 }
 
 PLUGIN_API int XPluginStart(
-						char *		outName,
-						char *		outSig,
-						char *		outDesc)
+	char* outName,
+	char* outSig,
+	char* outDesc)
 {
 
-		
+
 
 	XPLMMenuID	myMenu;
 	int			mySubMenuItem;
@@ -544,12 +571,12 @@ PLUGIN_API int XPluginStart(
 	if (comPort.empty()) {
 		return 0; // Failed to find Arduino Micro, do not start plugin
 	}
-	
+
 	if (!initSerialPort(comPort, 250000)) {
 		return 0; // Failed to initialize serial, do not start plugin
 	}
 	arduinoConnected = true;
-	
+
 	if (arduinoSerial.isOpen()) {
 		std::ostringstream oss;
 		oss << "M" << std::endl;
@@ -558,39 +585,39 @@ PLUGIN_API int XPluginStart(
 	}
 
 	/* Provide our plugin's profile to the plugin system. */
-	strcpy(outName, "ASpec");
-	strcpy(outSig, "com.aspec.twv1");
+	strcpy(outName, "RoninDevGru");
+	strcpy(outSig, "com.ronindevgru.twv1");
 	strcpy(outDesc, "A plugin for trim wheel module.");
 
 	/* First we put a new menu item into the plugin menu.
 	 * This menu item will contain a submenu for us. */
 	mySubMenuItem = XPLMAppendMenuItem(
-						XPLMFindPluginsMenu(),	/* Put in plugins menu */
-						"RoninDevGru",				/* Item Title */
-						0,						/* Item Ref */
-						1);						/* Force English */
-	
+		XPLMFindPluginsMenu(),	/* Put in plugins menu */
+		"RoninDevGru",				/* Item Title */
+		0,						/* Item Ref */
+		1);						/* Force English */
+
 	/* Now create a submenu attached to our menu item. */
 	myMenu = XPLMCreateMenu(
-						"Trim Wheel V1", 
-						XPLMFindPluginsMenu(), 
-						mySubMenuItem, 			/* Menu Item to attach to. */
-						MyMenuHandlerCallback,	/* The handler */
-						0);						/* Handler Ref */
+		"Trim Wheel V1",
+		XPLMFindPluginsMenu(),
+		mySubMenuItem, 			/* Menu Item to attach to. */
+		MyMenuHandlerCallback,	/* The handler */
+		0);						/* Handler Ref */
 	/* Append a few menu items to our submenu.  We will use the refcon to
  * store the amount we want to change the radio by. */
-	//XPLMAppendMenuItem(
-	//	myMenu,
-	//	"SEND Message",
-	//	(void*)-1000,
-	//	1);
-	//XPLMAppendMenuItem(
-	//	myMenu,
-	//	"AP Disc",
-	//	(void*)+1000,
-	//	1);
-
-		// Start the serial communication thread
+ //XPLMAppendMenuItem(
+ //	myMenu,
+ //	"SEND Message",
+ //	(void*)-1000,
+ //	1);
+ //XPLMAppendMenuItem(
+ //	myMenu,
+ //	"AP Disc",
+ //	(void*)+1000,
+ //	1);
+	//tbm900/switches/fuel/fuel_sel 0.0 = off, r = 1.0, l = 2.0
+	 // Start the serial communication thread
 	std::thread(serialPollingThread).detach();  // Detach the thread so it runs independently
 
 	gDataRef = XPLMFindDataRef("sim/cockpit2/controls/elevator_trim");
@@ -623,7 +650,7 @@ PLUGIN_API void	XPluginStop(void)
 		std::string txData = oss.str();
 		arduinoSerial.write(txData.c_str()); // Send Manual Trigger
 	}
-    keepRunning.store(false);  // Signal the thread to stop
+	keepRunning.store(false);  // Signal the thread to stop
 	XPLMUnregisterFlightLoopCallback(MyFlightLoopCallback, NULL);
 	// Unregister the flight loop callback
 
@@ -632,7 +659,7 @@ PLUGIN_API void	XPluginStop(void)
 	if (arduino.isOpen()) {
 		arduino.close();
 	}
-	
+
 
 	XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 	if (pitchTrimUpCommand != nullptr) {
@@ -692,23 +719,23 @@ PLUGIN_API int XPluginEnable(void)
 }
 
 PLUGIN_API void XPluginReceiveMessage(
-					XPLMPluginID	inFromWho,
-					int				inMessage,
-					void *			inParam)
+	XPLMPluginID	inFromWho,
+	int				inMessage,
+	void* inParam)
 {
 
 }
 
 
 void	MyMenuHandlerCallback(
-                                   void *               inMenuRef,    
-                                   void *               inItemRef)
+	void* inMenuRef,
+	void* inItemRef)
 {
 	/* This is our handler for the menu item.  Our inItemRef is the refcon
 	 * we registered in our XPLMAppendMenuItem calls.  It is either +1000 or
 	 * -1000 depending on which menu item is picked. */
 	ExecutePitchTrimUp();
-}                                   
+}
 
 float	MyFlightLoopCallback(
 	float                inElapsedSinceLastCall,
