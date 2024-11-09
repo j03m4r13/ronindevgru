@@ -53,6 +53,8 @@ XPLMCommandRef fuelOffCommand;
 bool fuelLeftActive = false;
 bool fuelRightActive = false;
 bool fuelOffActive = false;
+
+bool fuelSelectorInitCompleted = false;
 //************************************
 // TRIM WHEEL DEFINITION
 // Atomic flag to control thread execution
@@ -76,7 +78,7 @@ int prevTrimUp = 0;
 int currTrimUp = 0;
 int prevAutoPilotMode = 0;
 int prevAPModeTBM = 0;
-int prevState = 0;
+int prevState = -1;
 int currentTBMTrimState = 0;
 int autoPilotModeNormal = 0;
 
@@ -413,17 +415,17 @@ void serialPollingThread() {
 					std::string rxData = oss.str();
 					//XPLMDebugString(rxData.c_str());
 					//tbm900/switches/elec/ap_trims OFF = 0, AP OFF = 1, ON = 2
-					gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
-					if (gDataRef != NULL)
+					XPLMDataRef gElevTrimDataRef = XPLMFindDataRef("sim/cockpit2/controls/elevator_trim");
+					if (gElevTrimDataRef != NULL)
 					{
 						std::ostringstream oss3;
-						float trimWheelValf = XPLMGetDataf(gDataRef);
+						float trimWheelValf = XPLMGetDataf(gElevTrimDataRef);
 						if (receivedEncoderDirF == 1) {
 							trimWheelValf += 0.0025;
 							if (trimWheelValf > 1.0) {
 								trimWheelValf = 1.0;
 							}
-							XPLMSetDataf(gDataRef, trimWheelValf);
+							XPLMSetDataf(gElevTrimDataRef, trimWheelValf);
 						}
 						else if (receivedEncoderDirF == -1) {
 
@@ -431,7 +433,7 @@ void serialPollingThread() {
 							if (trimWheelValf < -1.0) {
 								trimWheelValf = -1.0;
 							}
-							XPLMSetDataf(gDataRef, trimWheelValf);
+							XPLMSetDataf(gElevTrimDataRef, trimWheelValf);
 						}
 						else if (receivedEncoderDirF == 2) {
 							triggerAPDisc.store(true);
@@ -628,9 +630,9 @@ int fuelOffCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* 
 // Thread function for polling and sending data via serial
 void serialPollingThreadFuelSelector() {
 	while (keepRunningFuelSelector.load()) {
-		if (!hasLoadedAircraftName && isInFlight()) {
+		if (!fuelSelectorInitCompleted && isInFlight()) {
 			userAircraft = getFirstAircraftModel();
-			hasLoadedAircraftName = true;
+			fuelSelectorInitCompleted = true;
 			gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
 			gFuelModeDataRef = XPLMFindDataRef("tbm900/switches/fuel/auto_man");
 			if (fuelSelectorSerial.isOpen()) {
@@ -659,7 +661,7 @@ void serialPollingThreadFuelSelector() {
 		}
 
 		try {
-			if (hasLoadedAircraftName && userAircraft == "TBM900.acf") {
+			if (fuelSelectorInitCompleted && userAircraft == "TBM900.acf") {
 				std::ostringstream oss;
 				std::ostringstream oss2;
 
@@ -759,6 +761,7 @@ PLUGIN_API int XPluginStart(
 	
 
 	if (arduinoSerial.isOpen()) {
+		prevState = -1;	// bug fix for non-initialized AP Trim Switch
 		std::ostringstream oss;
 		oss << "M" << std::endl;
 		std::string txData = oss.str();
@@ -853,7 +856,7 @@ PLUGIN_API int XPluginStart(
 		if (fuelOffCommand != nullptr) {
 			XPLMRegisterCommandHandler(fuelOffCommand, fuelOffCommandHandler, 1, nullptr);
 		}
-
+		fuelSelectorInitCompleted = false;
 	}
 
 
@@ -985,6 +988,7 @@ PLUGIN_API int XPluginEnable(void)
 		if (gFuelSelectorDataRef != NULL) {
 			currFuelSelectorPosition = 0.0;
 			prevFuelSelectorPosition = 0.0;
+			fuelSelectorInitCompleted = false;
 			float fuelSelectorPositionF = XPLMGetDataf(gFuelSelectorDataRef);
 			std::ostringstream oss;
 			oss << fuelSelectorPositionF;
