@@ -148,7 +148,9 @@ std::string enumerate_ports(int forPlugin = TW_PLUGIN)
 			}
 		}
 		else {
-			if (device.hardware_id.find("VID_4262&PID_3501") != std::string::npos) {
+
+			if (device.hardware_id.find("VID_4262&PID_3501") != std::string::npos ||
+				device.hardware_id.find("VID_2342&PID_3502") != std::string::npos) {
 
 				oss << "[RoninDevGru] Found Arduino Micro for the Fuel Selector Module: " << device.port.c_str() << std::endl;
 				XPLMDebugString(oss.str().c_str());
@@ -645,7 +647,7 @@ void serialPollingThreadFuelSelector() {
 						std::string fuelModeStr = oss.str();
 						fuelModeStr.append("\n");
 						XPLMDebugString(fuelModeStr.c_str());
-						fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Manual Trigger
+						fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Auto Trigger
 					}
 					else if (fuelMode == 1) {
 						oss << "T";
@@ -702,8 +704,8 @@ void serialPollingThreadFuelSelector() {
 								std::string fuelModeStr = oss.str();
 								fuelModeStr.append("\n");
 								//XPLMDebugString(fuelSelectorPositionInVal.c_str());
-								fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Manual Trigger
-								prevFuelSelectorPosition = 0.0; // reset to OFF for homing
+								fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Auto Trigger
+								prevFuelSelectorPosition = 1.0; // reset to OFF for homing
 							}
 							else if (fuelMode == 1) {
 								oss << "T";
