@@ -17,7 +17,7 @@
       "DocumentGroups": [
         {
           "DockedWidth": 200,
-          "SelectedChildIndex": 1,
+          "SelectedChildIndex": 2,
           "Children": [
             {
               "$type": "Document",
@@ -29,7 +29,12 @@
               "RelativeToolTip": "..\\..\\..\\..\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.41.34120\\include\\vcruntime.h",
               "ViewState": "AgIAAHgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000680|",
-              "WhenOpened": "2024-10-24T17:18:55.635Z"
+              "WhenOpened": "2024-10-24T17:18:55.635Z",
+              "IsPinned": true
+            },
+            {
+              "$type": "Bookmark",
+              "Name": "ST:0:0:{cce594b6-0c39-4442-ba28-10c64ac7e89f}"
             },
             {
               "$type": "Document",
@@ -37,16 +42,12 @@
               "Title": "SimData.cpp",
               "DocumentMoniker": "C:\\Users\\joema\\ronindevgru\\SimData\\SimData.cpp",
               "RelativeDocumentMoniker": "SimData.cpp",
-              "ToolTip": "C:\\Users\\joema\\ronindevgru\\SimData\\SimData.cpp*",
-              "RelativeToolTip": "SimData.cpp*",
-              "ViewState": "AgIAAK8CAAAAAAAAAAAAAMMCAAAkAAAAAAAAAA==",
+              "ToolTip": "C:\\Users\\joema\\ronindevgru\\SimData\\SimData.cpp",
+              "RelativeToolTip": "SimData.cpp",
+              "ViewState": "AgIAAKwCAAAAAAAAAAAUwLUCAAAAAAAAAAAAAA==",
               "Icon": "ae27a6b0-e345-4288-96df-5eaf394ee369.000677|",
               "WhenOpened": "2024-10-24T17:12:59.115Z",
               "EditorCaption": ""
-            },
-            {
-              "$type": "Bookmark",
-              "Name": "ST:0:0:{cce594b6-0c39-4442-ba28-10c64ac7e89f}"
             }
           ]
         }

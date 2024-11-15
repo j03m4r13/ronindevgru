@@ -6,14 +6,18 @@
 #include "XPLMDataAccess.h"
 #include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
+#include "XPLMDisplay.h"
 #include "XPLMMenus.h"
+#include "XPLMPlugin.h"
 #include "XPLMPlanes.h"
+#include "XPLMGraphics.h" 
 #include <thread>
 #include <atomic>
 #include "serial.h"
 #include <mutex>
 #include <vector>
 #include <cmath>
+#define XPLM_MSG_PLANE_LOADED 102
 #define TW_PLUGIN 1
 #define FS_PLUGIN 2
 
@@ -34,12 +38,29 @@
 
 #define FUEL_AUTO 1
 #define FUEL_MANUAL 2
+// tbm900/actuators/ap/disc 
+// sim/cockpit/autopilot/autopilot_mode = 2 else 1
+//tbm900/switches/elec/ap_trims OFF = 0, AP OFF = 1, ON = 2
+// sim/flight_controls/pitch_trim_down
+// sim/flight_controls/pitch_trim_up
 
+
+//tbm900/switches/fuel/fuel_sel 0.0 = off, r = 1.0, l = 2
+//sim/fuel/fuel_selector_lft
+//sim/fuel/fuel_selector_rgt
+//sim/fuel/fuel_selector_none
 //************************************
 // FUEL SELECTOR DEFINITIONS
-
+std::mutex dataRefMutex;
+std::mutex dataMutex, dataMutexTW;
 serial::Serial fuelSelectorSerial;
 std::atomic<bool> keepRunningFuelSelector(true);
+
+// SHARED DATA
+std::string receivedData;
+float prevTrimDown = 0.0f;
+float currTrimDown = 0.0f;
+/*********************/
 static XPLMDataRef		gFuelSelectorDataRef = NULL;
 static XPLMDataRef		gFuelModeDataRef = NULL;
 float currFuelSelectorPosition = 0.0;
@@ -49,6 +70,10 @@ int prevFuelSelectorState = 0;
 XPLMCommandRef fuelLeftCommand;
 XPLMCommandRef fuelRightCommand;
 XPLMCommandRef fuelOffCommand;
+
+float currentFuelMode = 0.0;
+float prevFuelMode = 0.0;
+
 
 bool fuelLeftActive = false;
 bool fuelRightActive = false;
@@ -72,11 +97,11 @@ XPLMCommandRef pitchTrimDownCommand;
 XPLMCommandRef autopilotDisconnectCommand;
 
 static std::string trimWheelValInStr;
-float prevTrimDown = 0.0f;
-float currTrimDown = 0.0f;
+
 int prevTrimUp = 0;
 int currTrimUp = 0;
 int prevAutoPilotMode = 0;
+int currAutoPilotMode = 0;
 int prevAPModeTBM = 0;
 int prevState = -1;
 int currentTBMTrimState = 0;
@@ -89,6 +114,23 @@ bool pitchTrimUpActive = false;
 bool pitchTrimDownActive = false;
 bool autoPilotDisconnected = false;
 bool triggerAP = false;
+bool planeLoadedFully = false;
+bool trimWheelActive = false;
+bool fuelSelectorActive = false;
+
+// MENU GUI
+int fsMenuIdx, twMenuIdx;
+XPLMMenuID	myMenu;
+int aboutMenuItemIndex;
+XPLMWindowID aboutWindow = NULL;
+static XPLMWindowID	g_window;
+void createAboutWindow();
+void drawAboutWindow(XPLMWindowID inWindowID, void* inRefcon);
+int handleMouseClick(XPLMWindowID inWindowID, int x, int y, XPLMMouseStatus inMouse, void* inRefcon);
+void closeAboutWindow();
+void serialCommsThreadFS();
+
+//*******************************************
 
 static void	MyMenuHandlerCallback(
 	void* inMenuRef,
@@ -178,6 +220,7 @@ std::string getFirstAircraftModel() {
 }
 
 bool isInFlight() {
+
 	// DataRefs for simulator state
 	XPLMDataRef pausedRef = XPLMFindDataRef("sim/time/paused");
 	XPLMDataRef xPosRef = XPLMFindDataRef("sim/flightmodel/position/local_x");
@@ -195,7 +238,7 @@ bool isInFlight() {
 			return true;
 		}
 	}
-
+	
 	return false;
 }
 
@@ -247,10 +290,25 @@ void CommandThread() {
 	std::this_thread::sleep_for(std::chrono::milliseconds(100)); // Example delay
 
 	// Set flag for main thread to pick up
+	std::lock_guard<std::mutex> lock(dataMutex);
 	triggerAPDisc.store(true);
 }
 
+void MyMessageHandler(
+	XPLMPluginID inFromWho,
+	int inMessage,
+	void* inParam)
+{
+	if (inMessage == XPLM_MSG_PLANE_LOADED) {
+		// This message indicates that the aircraft is fully loaded
+		// The plugin can be considered fully loaded at this point
+		planeLoadedFully = true;
+	}
+}
+
+
 float FlightLoopCallback(float inElapsedSinceLastCall, float inElapsedTimeSinceLastFlightLoop, int inCounter, void* inRefcon) {
+	std::lock_guard<std::mutex> lock(dataMutex);
 	if (triggerAPDisc.load()) {
 		// Execute pitch trim up command
 		if (autopilotDisconnectCommand != nullptr) {
@@ -267,156 +325,171 @@ float FlightLoopCallback(float inElapsedSinceLastCall, float inElapsedTimeSinceL
 	return -1.0f; // Return -1 to run every frame
 }
 
-// Thread function for polling and sending data via serial
-void serialPollingThread() {
-	while (keepRunning.load()) {
-		if (!hasLoadedAircraftName && isInFlight()) {
-			//XPLMDebugString("MODEL IS\n");
-			userAircraft = getFirstAircraftModel();
+
+// Command handler function
+int PitchTrimUpCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	std::lock_guard<std::mutex> lock(dataMutex);
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		pitchTrimUpActive = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		pitchTrimUpActive = false;
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
+
+// Command handler function
+int PitchTrimDownCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	std::lock_guard<std::mutex> lock(dataMutex);
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		pitchTrimDownActive = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		pitchTrimDownActive = false;
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
+
+// ******************** END OF TRIMWHEEL FUNCTIONS *********************//
+
+
+
+// ******************** FUEL SELECTOR FUNCTIONS ************************//
+
+// Command handler function
+int fuelLeftCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		fuelLeftActive = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		fuelLeftActive = false;
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
+
+// Command handler function
+int fuelRightCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		fuelRightActive = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		fuelRightActive = false;
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
+
+// Command handler function
+int fuelOffCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		fuelOffActive = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		fuelOffActive = false;
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
+
+
+
+float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastFlightLoop, int inCounter, void* inRefcon) {
+
+		std::lock_guard<std::mutex> lock(dataMutex);
+		if (!hasLoadedAircraftName) {
+
+			if (userAircraft.empty()) {
+				userAircraft = getFirstAircraftModel();
+			}
+
 			hasLoadedAircraftName = true;
 
 			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 			pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
 			autopilotDisconnectCommand = XPLMFindCommand("sim/autopilot/disconnect");
+			gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
 
+			XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+			if (pitchTrimUpCommand != nullptr) {
+				XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
+			}
+
+			XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+			if (pitchTrimDownCommand != nullptr) {
+				XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
+			}
+			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+			XPLMRegisterFlightLoopCallback(FlightLoopCallback, -1.0f, nullptr);
+			keepRunning.store(true);
+
+			std::thread(serialCommsThreadFS).detach();
+			fuelSelectorActive = true;
+			trimWheelActive = true;
+			prevState = -1;
 		}
-		//if (!arduinoConnected) continue;
-		// tbm900/actuators/ap/disc 
-		// sim/cockpit/autopilot/autopilot_mode = 2 else 1
-		//tbm900/switches/elec/ap_trims OFF = 0, AP OFF = 1, ON = 2
-		// sim/flight_controls/pitch_trim_down
-		// sim/flight_controls/pitch_trim_up
-		try {
-			if (hasLoadedAircraftName && userAircraft == "TBM900.acf") {
-				gDataRefTBM = XPLMFindDataRef("tbm900/switches/elec/ap_trims_raw");
-				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
-
-				XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
-				XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
 
 
-				int tbmTrimMode = XPLMGetDatai(gDataRefTBM);
-				int apModeTBM = XPLMGetDatai(gDataRef);
-				int currentState = -1;
+		if (trimWheelActive) {
+			try {
+				if (hasLoadedAircraftName && userAircraft == "TBM900.acf") {
 
-				if (tbmTrimMode == TBM_STATE_TRIM_OFF) {
-					currentState = TBM_STATE_TRIM_OFF;
-					currentTBMTrimState = currentState; // save current state;
-					//autoPilotDisconnected = false;
-				}
-				else if (tbmTrimMode == TBM_STATE_TRIM_ON) {
-					currentState = TBM_STATE_TRIM_ON;
-					currentTBMTrimState = currentState; // save current state;
-					//autoPilotDisconnected = false;
-				}
+					gDataRefTBM = XPLMFindDataRef("tbm900/switches/elec/ap_trims_raw");
+					gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
 
-				if (apModeTBM == TBM_AP_ON) {
-					currentState = TBM_STATE_AUTOPILOT_ON;
-					currentTBMTrimState = currentState; // save current state;
-					autoPilotDisconnected = false;
-				}
+					int tbmTrimMode = XPLMGetDatai(gDataRefTBM);
+					int apModeTBM = XPLMGetDatai(gDataRef);
+					int currentState = -1;
 
-				if (pitchTrimDownActive || pitchTrimUpActive) {
+					if (tbmTrimMode == TBM_STATE_TRIM_OFF) {
+						currentTBMTrimState = TBM_STATE_TRIM_OFF; // save current state;
+					}
+					else if (tbmTrimMode == TBM_STATE_TRIM_ON) {
+						currentTBMTrimState = TBM_STATE_TRIM_ON; // save current state;
+					}
 
-					currentState = TBM_STATE_TRIM_ON_MANUAL_PITCH_ON;
-					//autoPilotDisconnected = false;
+					if (apModeTBM == TBM_AP_ON) {
+						currentTBMTrimState = TBM_STATE_AUTOPILOT_ON; // save current state;
+						autoPilotDisconnected = false;
+					}
+
+					if (pitchTrimDownActive || pitchTrimUpActive) {
+						currentTBMTrimState = TBM_STATE_TRIM_ON_MANUAL_PITCH_ON; // 
+					}
 
 				}
 				else {
-					currentState = currentTBMTrimState;
-				}
 
-				if (arduinoSerial.isOpen()) {
-					if (currentState != prevState) {
-						std::ostringstream oss;
-						oss << "[RoninDevGru] STATE:" << currentState << std::endl;
-						XPLMDebugString(oss.str().c_str());
-						if (currentState == TBM_STATE_TRIM_OFF) {
-							std::ostringstream oss;
-							oss << "N" << std::endl;
-							std::string txData = oss.str();
-							arduinoSerial.write(txData.c_str());
+					gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
+					if (gDataRef != NULL)
+					{
+						
+						currAutoPilotMode = XPLMGetDatai(gDataRef);
+
+						if (pitchTrimDownActive || pitchTrimUpActive) {
+							currAutoPilotMode = YOKE_TRIM_MODE;
 						}
-						else if (currentState == TBM_STATE_TRIM_ON) {
-							std::ostringstream oss;
-							oss << "M" << std::endl;
-							std::string txData = oss.str();
-							arduinoSerial.write(txData.c_str());
-						}
-						else if (currentState == TBM_STATE_AUTOPILOT_ON) {
-							std::ostringstream oss;
-							oss << "A" << std::endl;
-							std::string txData = oss.str();
-							arduinoSerial.write(txData.c_str());
-						}
-						else if (currentState == TBM_STATE_TRIM_ON_MANUAL_PITCH_ON) {
-							std::ostringstream oss;
-							oss << "O" << std::endl;
-							std::string txData = oss.str();
-							arduinoSerial.write(txData.c_str());
-						}
-						prevState = currentState;
-					}
-				}
-
-			}
-			else {
-				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
-				if (gDataRef != NULL)
-				{
-					int autoPilotMode = XPLMGetDatai(gDataRef);
-
-					if (pitchTrimDownActive || pitchTrimUpActive) {
-						autoPilotMode = YOKE_TRIM_MODE;
-					}
-
-					if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == MANUAL_PILOT || autoPilotMode == MANUAL_PILOT_2) {
-
-						//NORMAL NON-TBM STUFF
-						std::ostringstream oss;
-						oss << "M" << std::endl;
-						std::string txData = oss.str();
-						arduinoSerial.write(txData.c_str());
-
-
-					}
-					else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == AUTO_PILOT) {
-
-						//NORMAL NON-TBM STUFF
-						std::ostringstream oss;
-						oss << "A" << std::endl;
-						std::string txData = oss.str();
-						arduinoSerial.write(txData.c_str());
-						autoPilotDisconnected = false;
-
-					}
-					else if (arduinoSerial.isOpen() && autoPilotMode != prevAutoPilotMode && autoPilotMode == YOKE_TRIM_MODE) {
-
-						std::ostringstream oss;
-						oss << "O" << std::endl;
-						std::string txData = oss.str();
-						arduinoSerial.write(txData.c_str());
-
+						
 					}
 					else {
 						std::cerr << "Failed to send data to COM port" << std::endl;
 					}
-					prevAutoPilotMode = autoPilotMode;
-				}
-				else {
-					std::cerr << "Failed to send data to COM port" << std::endl;
-				}
-			}
 
-			if (arduinoSerial.isOpen()) {
-				if (arduinoSerial.available()) {
-					std::string receivedData = arduinoSerial.read(arduinoSerial.available());
+				}
+
+				if (receivedData != "") {
 					int receivedEncoderDirF = std::stof(receivedData);
 					std::ostringstream oss;
 					oss << "Received: " << receivedData << std::endl;
 					std::string rxData = oss.str();
-					//XPLMDebugString(rxData.c_str());
-					//tbm900/switches/elec/ap_trims OFF = 0, AP OFF = 1, ON = 2
+
 					XPLMDataRef gElevTrimDataRef = XPLMFindDataRef("sim/cockpit2/controls/elevator_trim");
 					if (gElevTrimDataRef != NULL)
 					{
@@ -442,61 +515,212 @@ void serialPollingThread() {
 
 						}
 
+					}
 
+
+				}
+
+				gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
+				if (gDataRef != NULL)
+				{
+					currTrimDown = XPLMGetDataf(gDataRef);
+				}
+
+			}
+			catch (serial::IOException& e) {
+				std::ostringstream oss;
+				oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
+				XPLMDebugString(oss.str().c_str());
+			}
+
+		}
+
+		if (fuelSelectorActive) {
+
+			gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
+			gFuelModeDataRef = XPLMFindDataRef("tbm900/switches/fuel/auto_man");
+
+			if (gFuelSelectorDataRef != NULL && gFuelModeDataRef != NULL) {
+
+					if (gFuelSelectorDataRef != NULL) {
+						std::ostringstream oss;
+
+						int fuelMode = XPLMGetDatai(gFuelModeDataRef);
+				
+						currentFuelMode = fuelMode;	
+					}
+			}
+
+			try {
+				if (userAircraft == "TBM900.acf") {
+					if (gFuelSelectorDataRef != NULL)
+					{
+						currFuelSelectorPosition = XPLMGetDataf(gFuelSelectorDataRef);
+					}
+
+				}
+
+			}
+			catch (serial::IOException& e) {
+				std::ostringstream oss;
+				oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
+				XPLMDebugString(oss.str().c_str());
+			}
+		}
+	
+
+	return -1.0f; // Return -1 to run every frame
+}
+
+void serialCommsThreadFS() {
+	while (keepRunning.load()) {
+		
+		// TRIMWHEEL SERIAL RECEPTION
+		//std::ostringstream oss;
+		//oss << "[RoninDevGru] ALIVE FROM HERE" << std::endl;
+		//XPLMDebugString(oss.str().c_str());
+		if (fuelSelectorSerial.isOpen()) {
+			std::lock_guard<std::mutex> lock(dataMutex);
+			if (fuelSelectorActive) {
+				int fuelMode = currentFuelMode;
+				if (fuelMode != prevFuelMode) {
+					if (fuelMode == 0) {
+						std::ostringstream oss;
+						oss << "R";
+						std::string fuelModeStr = oss.str();
+						fuelModeStr.append("\n");
+						//XPLMDebugString(fuelModeStr.c_str());
+						fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Auto Trigger
+						prevFuelSelectorPosition = 1.0;
+					}
+					else if (fuelMode == 1) {
+						std::ostringstream oss;
+						oss << "T";
+						std::string fuelModeStr = oss.str();
+						fuelModeStr.append("\n");
+						//XPLMDebugString(fuelModeStr.c_str());
+						fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Manual Trigger
+					}
+					prevFuelMode = fuelMode;
+				}
+
+				float fuelSelectorPos = currFuelSelectorPosition;
+				if (fuelSelectorPos != prevFuelSelectorPosition) {
+					std::ostringstream oss;
+					oss << fuelSelectorPos;
+					std::string fuelSelectorPositionInVal = oss.str();
+					fuelSelectorPositionInVal.append("\n");
+					//XPLMDebugString(fuelSelectorPositionInVal.c_str());
+					fuelSelectorSerial.write(fuelSelectorPositionInVal.c_str()); // Send Manual Trigger
+					prevFuelSelectorPosition = fuelSelectorPos;
+				}
+				
+			}
+
+
+		}
+
+
+		if (arduinoSerial.isOpen()) {
+			std::lock_guard<std::mutex> lock(dataMutex);
+			if (trimWheelActive) {
+				if (userAircraft == "TBM900.acf") {
+					if (currentTBMTrimState != prevState) {
+						std::ostringstream oss;
+						oss << "[RoninDevGru] TBM TRIM STATE:" << currentTBMTrimState << std::endl;
+						//XPLMDebugString(oss.str().c_str());
+						if (currentTBMTrimState == TBM_STATE_TRIM_OFF) {
+							std::ostringstream oss;
+							oss << "N" << std::endl;
+							std::string txData = oss.str();
+							arduinoSerial.write(txData.c_str());
+						}
+						else if (currentTBMTrimState == TBM_STATE_TRIM_ON) {
+							std::ostringstream oss;
+							oss << "M" << std::endl;
+							std::string txData = oss.str();
+							arduinoSerial.write(txData.c_str());
+						}
+						else if (currentTBMTrimState == TBM_STATE_AUTOPILOT_ON) {
+							std::ostringstream oss;
+							oss << "A" << std::endl;
+							std::string txData = oss.str();
+							arduinoSerial.write(txData.c_str());
+						}
+						else if (currentTBMTrimState == TBM_STATE_TRIM_ON_MANUAL_PITCH_ON) {
+							std::ostringstream oss;
+							oss << "O" << std::endl;
+							std::string txData = oss.str();
+							arduinoSerial.write(txData.c_str());
+						}
+						prevState = currentTBMTrimState;
+					}
+
+				}
+				else {
+					if (currAutoPilotMode != prevAutoPilotMode && currAutoPilotMode == MANUAL_PILOT || currAutoPilotMode == MANUAL_PILOT_2) {
+
+						//NORMAL NON-TBM STUFF
+						std::ostringstream oss;
+						oss << "M" << std::endl;
+						std::string txData = oss.str();
+						arduinoSerial.write(txData.c_str());
 
 
 					}
-				}
-			}
-			else {
-				XPLMDebugString("[RoninDevGru] Serial communication is CLOSED");
-			}
+					else if (currAutoPilotMode != prevAutoPilotMode && currAutoPilotMode == AUTO_PILOT) {
 
+						//NORMAL NON-TBM STUFF
+						std::ostringstream oss;
+						oss << "A" << std::endl;
+						std::string txData = oss.str();
+						arduinoSerial.write(txData.c_str());
+						autoPilotDisconnected = false;
 
-			std::ostringstream oss;
-			std::ostringstream oss2;
+					}
+					else if (currAutoPilotMode != prevAutoPilotMode && currAutoPilotMode == YOKE_TRIM_MODE) {
 
-			gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
-			if (gDataRef != NULL)
-			{
-				currTrimDown = XPLMGetDataf(gDataRef);
-				if (currTrimDown != prevTrimDown) {
-					hasSentZeroDown = false;
-
-					if (arduinoSerial.isOpen()) {
-						float trimWheelValf = XPLMGetDataf(gDataRef);
-						oss << trimWheelValf;
-						std::string trimWheelValInStr = oss.str();
-						trimWheelValInStr.append("\n");
-						XPLMDebugString(trimWheelValInStr.c_str());
-						arduinoSerial.write(trimWheelValInStr.c_str());
+						std::ostringstream oss;
+						oss << "O" << std::endl;
+						std::string txData = oss.str();
+						arduinoSerial.write(txData.c_str());
 
 					}
 					else {
 						std::cerr << "Failed to send data to COM port" << std::endl;
 					}
-					prevTrimDown = currTrimDown;
+					prevAutoPilotMode = currAutoPilotMode;
+
+
+				}
+
+				
+
+				// TRIMWHEEL SERIAL RECEPTION
+				if (arduinoSerial.available()) {
+					receivedData = arduinoSerial.read(arduinoSerial.available());
+				}
+				else {
+					receivedData = "";
 				}
 
 
+				//
+				if (currTrimDown != prevTrimDown) {
+					std::ostringstream oss;
+					float trimWheelValf = XPLMGetDataf(gDataRef);
+					oss << trimWheelValf;
+					std::string trimWheelValInStr = oss.str();
+					trimWheelValInStr.append("\n");
+					XPLMDebugString(trimWheelValInStr.c_str());
+					arduinoSerial.write(trimWheelValInStr.c_str());
+					prevTrimDown = currTrimDown;
+				}
 			}
 
-
-			// Sleep or wait a bit to avoid overwhelming the serial communication
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		}
-		catch (serial::IOException& e) {
-			std::ostringstream oss;
-			oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
-			XPLMDebugString(oss.str().c_str());
-		}
-
+		std::this_thread::sleep_for(std::chrono::milliseconds(10));
 	}
-
-	std::ostringstream oss;
-	oss << "[RoninDevGru] Serial communication thread exiting... " << std::endl;
-
-	XPLMDebugString(oss.str().c_str());
 }
 
 
@@ -557,181 +781,99 @@ bool initSerialPort(const std::string& portName, uint32_t baudrate, int whichPlu
 	}
 	return false;
 }
-
-// Command handler function
-int PitchTrimUpCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
-	if (phase == xplm_CommandBegin) {
-		// Command has started (button pressed)
-		pitchTrimUpActive = true;
-	}
-	else if (phase == xplm_CommandEnd) {
-		// Command has ended (button released)
-		pitchTrimUpActive = false;
-	}
-	return 1; // Return 1 to let other plugins also handle the command
-}
-
-// Command handler function
-int PitchTrimDownCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
-	if (phase == xplm_CommandBegin) {
-		// Command has started (button pressed)
-		pitchTrimDownActive = true;
-	}
-	else if (phase == xplm_CommandEnd) {
-		// Command has ended (button released)
-		pitchTrimDownActive = false;
-	}
-	return 1; // Return 1 to let other plugins also handle the command
-}
-
-// ******************** END OF TRIMWHEEL FUNCTIONS *********************//
-
-
-
-// ******************** FUEL SELECTOR FUNCTIONS ************************//
-
-// Command handler function
-int fuelLeftCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
-	if (phase == xplm_CommandBegin) {
-		// Command has started (button pressed)
-		fuelLeftActive = true;
-	}
-	else if (phase == xplm_CommandEnd) {
-		// Command has ended (button released)
-		fuelLeftActive = false;
-	}
-	return 1; // Return 1 to let other plugins also handle the command
-}
-
-// Command handler function
-int fuelRightCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
-	if (phase == xplm_CommandBegin) {
-		// Command has started (button pressed)
-		fuelRightActive = true;
-	}
-	else if (phase == xplm_CommandEnd) {
-		// Command has ended (button released)
-		fuelRightActive = false;
-	}
-	return 1; // Return 1 to let other plugins also handle the command
-}
-
-// Command handler function
-int fuelOffCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
-	if (phase == xplm_CommandBegin) {
-		// Command has started (button pressed)
-		fuelOffActive = true;
-	}
-	else if (phase == xplm_CommandEnd) {
-		// Command has ended (button released)
-		fuelOffActive = false;
-	}
-	return 1; // Return 1 to let other plugins also handle the command
-}
-
-// Thread function for polling and sending data via serial
-void serialPollingThreadFuelSelector() {
-	while (keepRunningFuelSelector.load()) {
-		if (!fuelSelectorInitCompleted && isInFlight()) {
-			userAircraft = getFirstAircraftModel();
-			fuelSelectorInitCompleted = true;
-			gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
-			gFuelModeDataRef = XPLMFindDataRef("tbm900/switches/fuel/auto_man");
-			if (fuelSelectorSerial.isOpen()) {
-				if (gFuelSelectorDataRef != NULL) {
-					std::ostringstream oss;
-
-					int fuelMode = XPLMGetDatai(gFuelModeDataRef);
-					if (fuelMode == 0) {
-						oss << "R";
-						std::string fuelModeStr = oss.str();
-						fuelModeStr.append("\n");
-						XPLMDebugString(fuelModeStr.c_str());
-						fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Auto Trigger
-					}
-					else if (fuelMode == 1) {
-						oss << "T";
-						std::string fuelModeStr = oss.str();
-						fuelModeStr.append("\n");
-						XPLMDebugString(fuelModeStr.c_str());
-						fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Manual Trigger
-					}
-
-
-				}
-			}
-		}
-
-		try {
-			if (fuelSelectorInitCompleted && userAircraft == "TBM900.acf") {
-				std::ostringstream oss;
-				std::ostringstream oss2;
-
-				if (gFuelSelectorDataRef != NULL)
-				{
-					currFuelSelectorPosition = XPLMGetDataf(gFuelSelectorDataRef);
-					//if (fmod(currFuelSelectorPosition, 0.1) == 0) {
-						if (currFuelSelectorPosition != prevFuelSelectorPosition) {
-
-							if (fuelSelectorSerial.isOpen()) {
-								if (gFuelSelectorDataRef != NULL) {
-				
-									float fuelSelectorPositionF = XPLMGetDataf(gFuelSelectorDataRef);
-									std::ostringstream oss;
-									oss << fuelSelectorPositionF;
-									std::string fuelSelectorPositionInVal = oss.str();
-									fuelSelectorPositionInVal.append("\n");
-									//XPLMDebugString(fuelSelectorPositionInVal.c_str());
-									fuelSelectorSerial.write(fuelSelectorPositionInVal.c_str()); // Send Manual Trigger
-
-								}
-							}
-							prevFuelSelectorPosition = currFuelSelectorPosition;
-						}
-
-					//}
-
-				}
-
-				gFuelModeDataRef = XPLMFindDataRef("tbm900/switches/fuel/auto_man");
-				if (fuelSelectorSerial.isOpen()) {
-					if (gFuelSelectorDataRef != NULL) {
-						std::ostringstream oss;
-						int fuelMode = XPLMGetDatai(gFuelModeDataRef);
-						if (fuelMode != prevFuelSelectorState) {
-							if (fuelMode == 0) {
-								oss << "R";
-								std::string fuelModeStr = oss.str();
-								fuelModeStr.append("\n");
-								//XPLMDebugString(fuelSelectorPositionInVal.c_str());
-								fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Auto Trigger
-								prevFuelSelectorPosition = 1.0; // reset to OFF for homing
-							}
-							else if (fuelMode == 1) {
-								oss << "T";
-								std::string fuelModeStr = oss.str();
-								fuelModeStr.append("\n");
-								//XPLMDebugString(fuelSelectorPositionInVal.c_str());
-								fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Manual Trigger
-							}
-						}
-
-						prevFuelSelectorState = fuelMode;
-
-					}
-				}
-			}
-
-			// Sleep or wait a bit to avoid overwhelming the serial communication
-			std::this_thread::sleep_for(std::chrono::milliseconds(10));
-		}
-		catch (serial::IOException& e) {
-			std::ostringstream oss;
-			oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
-			XPLMDebugString(oss.str().c_str());
-		}
-	}
-}
+//
+//
+//// Thread function for polling and sending data via serial
+//void serialCommsThreadTW() {
+//	while (keepRunningFuelSelector.load()) {
+//		
+//		std::lock_guard<std::mutex> lock(dataMutex);
+//
+//		if (arduinoSerial.isOpen()) {
+//			
+//			if (currentTBMTrimState != prevState) {
+//				std::ostringstream oss;
+//				oss << "[RoninDevGru] TBM TRIM STATE:" << currentTBMTrimState << std::endl;
+//				//XPLMDebugString(oss.str().c_str());
+//				if (currentTBMTrimState == TBM_STATE_TRIM_OFF) {
+//					std::ostringstream oss;
+//					oss << "N" << std::endl;
+//					std::string txData = oss.str();
+//					arduinoSerial.write(txData.c_str());
+//				}
+//				else if (currentTBMTrimState == TBM_STATE_TRIM_ON) {
+//					std::ostringstream oss;
+//					oss << "M" << std::endl;
+//					std::string txData = oss.str();
+//					arduinoSerial.write(txData.c_str());
+//				}
+//				else if (currentTBMTrimState == TBM_STATE_AUTOPILOT_ON) {
+//					std::ostringstream oss;
+//					oss << "A" << std::endl;
+//					std::string txData = oss.str();
+//					arduinoSerial.write(txData.c_str());
+//				}
+//				else if (currentTBMTrimState == TBM_STATE_TRIM_ON_MANUAL_PITCH_ON) {
+//					std::ostringstream oss;
+//					oss << "O" << std::endl;
+//					std::string txData = oss.str();
+//					arduinoSerial.write(txData.c_str());
+//				}
+//				prevState = currentTBMTrimState;
+//			}
+//
+//			if (currAutoPilotMode != prevAutoPilotMode && currAutoPilotMode == MANUAL_PILOT || currAutoPilotMode == MANUAL_PILOT_2) {
+//
+//				//NORMAL NON-TBM STUFF
+//				std::ostringstream oss;
+//				oss << "M" << std::endl;
+//				std::string txData = oss.str();
+//				arduinoSerial.write(txData.c_str());
+//
+//
+//			}
+//			else if (currAutoPilotMode != prevAutoPilotMode && currAutoPilotMode == AUTO_PILOT) {
+//
+//				//NORMAL NON-TBM STUFF
+//				std::ostringstream oss;
+//				oss << "A" << std::endl;
+//				std::string txData = oss.str();
+//				arduinoSerial.write(txData.c_str());
+//				autoPilotDisconnected = false;
+//
+//			}
+//			else if (currAutoPilotMode != prevAutoPilotMode && currAutoPilotMode == YOKE_TRIM_MODE) {
+//
+//				std::ostringstream oss;
+//				oss << "O" << std::endl;
+//				std::string txData = oss.str();
+//				arduinoSerial.write(txData.c_str());
+//
+//			}
+//			else {
+//				std::cerr << "Failed to send data to COM port" << std::endl;
+//			}
+//			prevAutoPilotMode = currAutoPilotMode;
+//
+//
+//			receivedData = arduinoSerial.read(arduinoSerial.available());
+//
+//
+//			//
+//			if (currTrimDown != prevTrimDown) {
+//				std::ostringstream oss;
+//				float trimWheelValf = XPLMGetDataf(gDataRef);
+//				oss << trimWheelValf;
+//				std::string trimWheelValInStr = oss.str();
+//				trimWheelValInStr.append("\n");
+//				XPLMDebugString(trimWheelValInStr.c_str());
+//				arduinoSerial.write(trimWheelValInStr.c_str());
+//				prevTrimDown = currTrimDown;
+//			}
+//		}
+//		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+//	}
+//}
 
 // ******************** END OF FUEL SELECTOR FUNCTIONS *****************//
 
@@ -741,59 +883,9 @@ PLUGIN_API int XPluginStart(
 	char* outDesc)
 {
 
-
-
-	XPLMMenuID	myMenu;
 	int			mySubMenuItem;
-	std::string comPort = enumerate_ports(TW_PLUGIN);  // Change this to the detected COM port number
-	prevAutoPilotMode = 0;
-	//	// Initialize the serial port
-	if (comPort.empty()) {
-		//return 0; // Failed to find Arduino Micro, till try to start plugin
-	}
-	else {
-		if (!initSerialPort(comPort, 250000)) {
-			//return 0; // Failed to initialize serial, still try to start plugin for the other module
-		}
-		else {
-			arduinoConnected = true;
-		}
-	}
-
-	
-
-	if (arduinoSerial.isOpen()) {
-		prevState = -1;	// bug fix for non-initialized AP Trim Switch
-		std::ostringstream oss;
-		oss << "M" << std::endl;
-		std::string txData = oss.str();
-		arduinoSerial.write(txData.c_str()); // Send Manual Trigger // Release Stepper
-
-		// Start the serial communication thread for TRIM WHEEL
-		std::thread(serialPollingThread).detach();  // Detach the thread so it runs independently
-
-		gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
-
-		XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
-		if (pitchTrimUpCommand != nullptr) {
-			XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
-		}
-
-		XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
-		if (pitchTrimDownCommand != nullptr) {
-			XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
-		}
-		pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
-		XPLMRegisterFlightLoopCallback(FlightLoopCallback, -1.0f, nullptr);
-
-		autoPilotDisconnected = false;
-	}
-
-	/* Provide our plugin's profile to the plugin system. */
-	strcpy(outName, "RoninDevGru");
-	strcpy(outSig, "com.ronindevgru.twv1");
-	strcpy(outDesc, "A plugin for trim wheel module.");
-
+	userAircraft = "";
+	planeLoadedFully = false;
 	/* First we put a new menu item into the plugin menu.
 	 * This menu item will contain a submenu for us. */
 	mySubMenuItem = XPLMAppendMenuItem(
@@ -809,22 +901,68 @@ PLUGIN_API int XPluginStart(
 		mySubMenuItem, 			/* Menu Item to attach to. */
 		MyMenuHandlerCallback,	/* The handler */
 		0);						/* Handler Ref */
-	/* Append a few menu items to our submenu.  We will use the refcon to
- * store the amount we want to change the radio by. */
- //XPLMAppendMenuItem(
- //	myMenu,
- //	"SEND Message",
- //	(void*)-1000,
- //	1);
- //XPLMAppendMenuItem(
- //	myMenu,
- //	"AP Disc",
- //	(void*)+1000,
- //	1);
-	//tbm900/switches/fuel/fuel_sel 0.0 = off, r = 1.0, l = 2
-	//sim/fuel/fuel_selector_lft
-	//sim/fuel/fuel_selector_rgt
-	//sim/fuel/fuel_selector_none
+	twMenuIdx = XPLMAppendMenuItem(
+		myMenu,
+		"TrimWheel [OFFLINE]",
+		(void*)0,
+		1);
+	fsMenuIdx = XPLMAppendMenuItem(
+		myMenu,
+		"Fuel Selector [OFFLINE]",
+		(void*)0,
+		1);
+
+	aboutMenuItemIndex = XPLMAppendMenuItem(myMenu, "About Us", (void*)"about", 1);
+
+	std::string comPort = enumerate_ports(TW_PLUGIN);  // Change this to the detected COM port number
+	prevAutoPilotMode = 0;
+	//	// Initialize the serial port
+	if (comPort.empty()) {
+		std::ostringstream oss;
+		oss << "[RoninDevGru] TrimWheel Module not found." << std::endl;
+		XPLMDebugString(oss.str().c_str());
+		XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [OFFLINE]", 1);
+		//return 0; // Failed to find Arduino Micro, till try to start plugin
+	}
+	else {
+		if (!initSerialPort(comPort, 250000)) {
+			std::ostringstream oss;
+			oss << "[RoninDevGru] Cannot communicate to TrimWheel Module. Please check the connections." << std::endl;
+			XPLMDebugString(oss.str().c_str());
+			XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [OFFLINE]", 1);
+		}
+		else {
+			std::ostringstream oss;
+			oss << "[RoninDevGru] TrimWheel Module connected. Waiting for XP to load flight." << std::endl;
+			XPLMDebugString(oss.str().c_str());
+			XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [ONLINE]", 1);
+			arduinoConnected = true;
+		}
+	}
+
+	
+
+	if (arduinoSerial.isOpen()) {
+
+
+		prevState = -1;	// bug fix for non-initialized AP Trim Switch
+		std::ostringstream oss;
+		oss << "M" << std::endl;
+		std::string txData = oss.str();
+		arduinoSerial.write(txData.c_str()); // Send Manual Trigger // Release Stepper
+
+		// Start the serial communication thread for TRIM WHEEL
+		//trimWheelActive = true;
+
+		autoPilotDisconnected = false;
+		XPLMSetMenuItemName(myMenu,twMenuIdx, "Trim Wheel [ONLINE]", 1);
+	}
+
+	/* Provide our plugin's profile to the plugin system. */
+	strcpy(outName, "RoninDevGru");
+	strcpy(outSig, "com.ronindevgru.twv1");
+	strcpy(outDesc, "A plugin for trim wheel module.");
+
 
 
 	// ** FUEL SELECTOR INITIALIZATION ****
@@ -832,38 +970,53 @@ PLUGIN_API int XPluginStart(
 	std::string comPort2 = enumerate_ports(FS_PLUGIN);
 
 	if (comPort2.empty()) {
-		//return 0; // Failed to find Arduino Micro,try to start plugin
-	}
-
-	if (!initSerialPort(comPort2, 250000, FS_PLUGIN)) {
-		return 0; // Failed to initialize serial, do not start plugin
+		std::ostringstream oss;
+		oss << "[RoninDevGru] FuelSelector Module not found." << std::endl;
+		XPLMDebugString(oss.str().c_str());
+		XPLMSetMenuItemName(myMenu, fsMenuIdx, "Fuel Selector [OFFLINE]", 1);
 	}
 	else {
-		// TODO: MUST CHECK FOR TBM900 ONLY
-		//tbm900/switches/fuel/auto_man 1 = man, 0 = auto
-		//tbm900 / switches / fuel / fuel_sel
-		std::thread(serialPollingThreadFuelSelector).detach();
 
-		fuelLeftCommand = XPLMFindCommand("sim/fuel/fuel_selector_lft");
-		if (fuelLeftCommand != nullptr) {
-			XPLMRegisterCommandHandler(fuelLeftCommand, fuelLeftCommandHandler, 1, nullptr);
+		if (!initSerialPort(comPort2, 250000, FS_PLUGIN)) {
+			std::ostringstream oss;
+			oss << "[RoninDevGru] FuelSelector Module is not responding. Please check your connections." << std::endl;
+			XPLMDebugString(oss.str().c_str());
+			XPLMSetMenuItemName(myMenu, fsMenuIdx, "Fuel Selector [OFFLINE]", 1);
+		}
+		else {
+			// TODO: MUST CHECK FOR TBM900 ONLY
+			//tbm900/switches/fuel/auto_man 1 = man, 0 = auto
+			//tbm900 / switches / fuel / fuel_sel
+			std::ostringstream oss;
+			oss << "[RoninDevGru] FuelSelector Module connected. Waiting for XP to load flight." << std::endl;
+			XPLMDebugString(oss.str().c_str());
+
+			//fuelSelectorInitCompleted = false;
+			//std::thread(serialPollingThreadFuelSelector).detach();
+
+			fuelLeftCommand = XPLMFindCommand("sim/fuel/fuel_selector_lft");
+			if (fuelLeftCommand != nullptr) {
+				XPLMRegisterCommandHandler(fuelLeftCommand, fuelLeftCommandHandler, 1, nullptr);
+			}
+
+			fuelRightCommand = XPLMFindCommand("sim/fuel/fuel_selector_rgt");
+			if (fuelRightCommand != nullptr) {
+				XPLMRegisterCommandHandler(fuelRightCommand, fuelRightCommandHandler, 1, nullptr);
+			}
+
+			fuelOffCommand = XPLMFindCommand("sim/fuel/fuel_selector_none");
+			if (fuelOffCommand != nullptr) {
+				XPLMRegisterCommandHandler(fuelOffCommand, fuelOffCommandHandler, 1, nullptr);
+			}
+			XPLMSetMenuItemName(myMenu, fsMenuIdx, "Fuel Selector [ONLINE]", 1);
+			prevFuelSelectorPosition = 1.0;
+			//fuelSelectorActive = true;
 		}
 
-		fuelRightCommand = XPLMFindCommand("sim/fuel/fuel_selector_rgt");
-		if (fuelRightCommand != nullptr) {
-			XPLMRegisterCommandHandler(fuelRightCommand, fuelRightCommandHandler, 1, nullptr);
-		}
-
-		fuelOffCommand = XPLMFindCommand("sim/fuel/fuel_selector_none");
-		if (fuelOffCommand != nullptr) {
-			XPLMRegisterCommandHandler(fuelOffCommand, fuelOffCommandHandler, 1, nullptr);
-		}
-		fuelSelectorInitCompleted = false;
 	}
 
-
-
-
+	//std::thread(serialCommsThreadTW).detach();
+	XPLMRegisterFlightLoopCallback(MainFlightLoop, -1.0f, nullptr);
 	/* Only return that we initialized correctly if we found the data ref. */
 	//return (gDataRef != NULL) ? 1 : 0;
 	return 1;
@@ -884,8 +1037,10 @@ PLUGIN_API void	XPluginStop(void)
 	// Unregister the flight loop callback
 
 	XPLMUnregisterFlightLoopCallback(FlightLoopCallback, nullptr);
+	XPLMUnregisterFlightLoopCallback(MainFlightLoop, nullptr);
 	// Stop the serial communication thread
 	if (arduino.isOpen()) {
+		trimWheelActive = false;
 		arduino.close();
 	}
 
@@ -913,6 +1068,13 @@ PLUGIN_API void	XPluginStop(void)
 
 	// Stop the serial communication thread
 	if (fuelSelectorSerial.isOpen()) {
+		fuelSelectorActive = false;
+		std::ostringstream oss;
+		oss << "T";
+		std::string fuelModeStr = oss.str();
+		fuelModeStr.append("\n");
+		//XPLMDebugString(fuelModeStr.c_str());
+		fuelSelectorSerial.write(fuelModeStr.c_str()); // Send DISENGAGE command
 		fuelSelectorSerial.close();
 	}
 
@@ -932,11 +1094,14 @@ PLUGIN_API void XPluginDisable(void)
 	}
 	keepRunning.store(false);  // Signal the thread to stop
 	XPLMUnregisterFlightLoopCallback(FlightLoopCallback, NULL);
+	XPLMUnregisterFlightLoopCallback(MainFlightLoop, nullptr);
 	//// Stop the serial communication thread
 
 	//// Close serial port
 	if (arduinoSerial.isOpen()) {
 		arduinoSerial.close();
+		XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [OFFLINE]", 1);
+		trimWheelActive = false;
 	}
 //  END OF TRIMWHEEL DISABLE FUNCTIONS
 // FUEL SELECTOR DISABLE FUNCTION
@@ -946,28 +1111,48 @@ PLUGIN_API void XPluginDisable(void)
 
 	//// Close serial port
 	if (fuelSelectorSerial.isOpen()) {
+		XPLMSetMenuItemName(myMenu, fsMenuIdx, "Fuel Selector [OFFLINE]", 1);
 		fuelSelectorSerial.close();
+		fuelSelectorActive = false;
 	}
 // END OF FUEL SELECTOR DISABLE FUNCTION
 }
 
 PLUGIN_API int XPluginEnable(void)
 {
+	
 // TRIM WHEEL ENABLE FUNCTIONS
+	std::ostringstream oss;
+	oss << "[RoninDevGru] PLUGIN ENABLED." << std::endl;
+	XPLMDebugString(oss.str().c_str());
 	if (!arduinoSerial.isOpen()) {
 		std::string comPort = enumerate_ports();  // Change this to the detected COM port number
 
-		// Initialize the serial port
 		if (comPort.empty()) {
-			
+			std::ostringstream oss;
+			oss << "[RoninDevGru] TrimWheel Module not found." << std::endl;
+			XPLMDebugString(oss.str().c_str());
+			XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [OFFLINE]", 1);
+			//return 0; // Failed to find Arduino Micro, till try to start plugin
 		}
 		else {
 			if (!initSerialPort(comPort, 250000)) {
+				std::ostringstream oss;
+				oss << "[RoninDevGru] Cannot communicate to TrimWheel Module. Please check the connections." << std::endl;
+				XPLMDebugString(oss.str().c_str());
+				XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [OFFLINE]", 1);
 			}
-			prevAutoPilotMode = 0;
-			keepRunning.store(true);
-			std::thread(serialPollingThread).detach();
+			else {
+				std::ostringstream oss;
+				oss << "[RoninDevGru] TrimWheel Module connected. Waiting for XP to load flight." << std::endl;
+				XPLMDebugString(oss.str().c_str());
+				XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [ONLINE]", 1);
+				arduinoConnected = true;
+				prevState = -1;	// bug fix for non-initialized AP Trim Switch
+				prevAutoPilotMode = 0;
+				trimWheelActive = true;
 
+			}
 		}
 
 	}
@@ -977,30 +1162,50 @@ PLUGIN_API int XPluginEnable(void)
 	if (!fuelSelectorSerial.isOpen()) {
 		std::string comPort = enumerate_ports(FS_PLUGIN);  // Change this to the detected COM port number
 
-		// Initialize the serial port
+
 		if (comPort.empty()) {
-			return 0; // Failed to find Arduino Micro, do not start plugin
-		}
-
-		if (!initSerialPort(comPort, 250000, FS_PLUGIN)) {
-			return 0; // Failed to initialize serial, do not start plugin
-		}
-		keepRunningFuelSelector.store(true);
-		std::thread(serialPollingThreadFuelSelector).detach();
-		if (gFuelSelectorDataRef != NULL) {
-			currFuelSelectorPosition = 0.0;
-			prevFuelSelectorPosition = 0.0;
-			fuelSelectorInitCompleted = false;
-			float fuelSelectorPositionF = XPLMGetDataf(gFuelSelectorDataRef);
 			std::ostringstream oss;
-			oss << fuelSelectorPositionF;
-			std::string fuelSelectorPositionInVal = oss.str();
-			fuelSelectorPositionInVal.append("\n");
-			//XPLMDebugString(fuelSelectorPositionInVal.c_str());
-			fuelSelectorSerial.write(fuelSelectorPositionInVal.c_str()); // Send Manual Trigger
+			oss << "[RoninDevGru] FuelSelector Module not found." << std::endl;
+			XPLMDebugString(oss.str().c_str());
+			XPLMSetMenuItemName(myMenu, fsMenuIdx, "Fuel Selector [OFFLINE]", 1);
+		}
+		else {
+			if (!initSerialPort(comPort, 250000, FS_PLUGIN)) {
+				std::ostringstream oss;
+				oss << "[RoninDevGru] FuelSelector Module is not responding. Please check your connections." << std::endl;
+				XPLMDebugString(oss.str().c_str());
+				XPLMSetMenuItemName(myMenu, fsMenuIdx, "Fuel Selector [OFFLINE]", 1);
+			}
+			else {
+				XPLMSetMenuItemName(myMenu, fsMenuIdx, "Fuel Selector [ONLINE]", 1);
+				keepRunningFuelSelector.store(true);
+				fuelSelectorInitCompleted = false;
+				gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
+				//std::thread(serialPollingThreadFuelSelector).detach();
+				if (gFuelSelectorDataRef != NULL) {
+					
+					currFuelSelectorPosition = 0.0;
+					prevFuelSelectorPosition = 0.0;
+					float fuelSelectorPositionF = XPLMGetDataf(gFuelSelectorDataRef);
+					std::ostringstream oss;
+					oss << fuelSelectorPositionF;
+					std::string fuelSelectorPositionInVal = oss.str();
+					fuelSelectorPositionInVal.append("\n");
+					//XPLMDebugString(fuelSelectorPositionInVal.c_str());
+					fuelSelectorSerial.write(fuelSelectorPositionInVal.c_str()); // Send Manual Trigger
+					fuelSelectorActive = true;
+				}
+			}
 
 		}
+
 	}
+	//keepRunning.store(true);
+	//keepRunningFuelSelector.store(true);
+	//std::thread(serialCommsThreadFS).detach();
+	//std::thread(serialCommsThreadTW).detach();
+	//XPLMRegisterFlightLoopCallback(FlightLoopCallback, -1.0f, nullptr);
+	//XPLMRegisterFlightLoopCallback(MainFlightLoop, -1.0f, nullptr);
 // END OF FUEL SELECTOR ENABLE FUNCTIONS
 	return 1;
 }
@@ -1010,8 +1215,92 @@ PLUGIN_API void XPluginReceiveMessage(
 	int				inMessage,
 	void* inParam)
 {
-
+	if (inMessage == XPLM_MSG_PLANE_LOADED) {
+		// This message indicates the aircraft is fully loaded
+		planeLoadedFully = true;
+		XPLMDebugString("Aircraft fully loaded.\n");
+	}
 }
+// Function to create the "About Us" window
+void createAboutWindow() {
+	// Define the window's bounds
+	int left = 100;
+	int top = 600;
+	int right = 400;
+	int bottom = 400;
+
+	// Create the window
+	aboutWindow = XPLMCreateWindow(
+		left, top, right, bottom,       // Window bounds
+		1,                              // Start visible
+		drawAboutWindow,                // Draw callback
+		NULL,               // Mouse click callback for close button
+		handleMouseClick,                           // Key callback (optional)
+		NULL                          // Cursor status callback (optional)
+		
+	);
+}
+
+// Function to draw the "About Us" window with a close button
+void drawAboutWindow(XPLMWindowID inWindowID, void* inRefcon) {
+	// Get the window's current bounds
+	int left, top, right, bottom;
+	XPLMGetWindowGeometry(inWindowID, &left, &top, &right, &bottom);
+
+	// Draw a translucent dark background box
+	XPLMDrawTranslucentDarkBox(left, top, right, bottom);
+
+	// Define the content of the "About Us" window
+	const char* aboutText = "Plugin by RoninDevGru";
+	float white[] = {1.0, 1.0, 1.0};
+	// Draw the text inside the window
+	XPLMDrawString(white , left + 20, top - 30, (char*)aboutText, NULL, xplmFont_Proportional);
+
+	// Draw the "Close" button as a small rectangle with text
+	const int buttonWidth = 50;
+	const int buttonHeight = 20;
+	int buttonLeft = right - buttonWidth - 10;
+	int buttonBottom = bottom + 10;
+
+	XPLMDrawTranslucentDarkBox(buttonLeft, buttonBottom + buttonHeight, buttonLeft + buttonWidth, buttonBottom);
+
+	// Draw "Close" text on the button
+	
+	XPLMDrawString(white, buttonLeft + 5, buttonBottom + 5, (char*)"Close", NULL, xplmFont_Proportional);
+}
+
+// Function to handle mouse clicks for closing the window
+int handleMouseClick(XPLMWindowID inWindowID, int x, int y, XPLMMouseStatus inMouse, void* inRefcon) {
+	if (inMouse == xplm_MouseDown) {
+		// Get the window's current bounds
+		int left, top, right, bottom;
+		XPLMGetWindowGeometry(inWindowID, &left, &top, &right, &bottom);
+
+		// Define close button bounds
+		const int buttonWidth = 50;
+		const int buttonHeight = 20;
+		int buttonLeft = right - buttonWidth - 10;
+		int buttonBottom = bottom + 10;
+
+		// Check if click is inside the close button area
+		if (x >= buttonLeft && x <= buttonLeft + buttonWidth &&
+			y >= buttonBottom && y <= buttonBottom + buttonHeight) {
+			closeAboutWindow();
+			return 1;  // Indicate that the click was handled
+		}
+	}
+	return 0;  // Click not handled
+}
+
+
+// Function to close the window
+void closeAboutWindow() {
+	if (aboutWindow != NULL) {
+		XPLMDestroyWindow(aboutWindow);
+		aboutWindow = NULL;
+	}
+}
+
 
 
 void	MyMenuHandlerCallback(
@@ -1021,5 +1310,10 @@ void	MyMenuHandlerCallback(
 	/* This is our handler for the menu item.  Our inItemRef is the refcon
 	 * we registered in our XPLMAppendMenuItem calls.  It is either +1000 or
 	 * -1000 depending on which menu item is picked. */
-	ExecutePitchTrimUp();
+	if (inItemRef == (void*)"about") {
+		// Create and display the About Us window if not already open
+		if (aboutWindow == NULL) {
+			createAboutWindow();
+		}
+	}
 }
