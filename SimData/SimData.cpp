@@ -58,6 +58,7 @@ std::atomic<bool> keepRunningFuelSelector(true);
 
 // SHARED DATA
 std::string receivedData;
+std::string receivedDataFS;
 float prevTrimDown = 0.0f;
 float currTrimDown = 0.0f;
 /*********************/
@@ -95,6 +96,12 @@ static XPLMDataRef		gDataRefTBMPitchDownSwitch = NULL;
 XPLMCommandRef pitchTrimUpCommand;
 XPLMCommandRef pitchTrimDownCommand;
 XPLMCommandRef autopilotDisconnectCommand;
+XPLMCommandRef CWSCommand;
+XPLMCommandRef PTTCommand;
+XPLMCommandRef LeftFuelSelectorCommand;
+XPLMCommandRef RightFuelSelectorCommand;
+XPLMCommandRef OffFuelSelectorCommand;
+XPLMCommandRef ShiftFuelSelectorCommand;
 
 static std::string trimWheelValInStr;
 
@@ -117,6 +124,7 @@ bool triggerAP = false;
 bool planeLoadedFully = false;
 bool trimWheelActive = false;
 bool fuelSelectorActive = false;
+bool CWSActive = false;
 
 // MENU GUI
 int fsMenuIdx, twMenuIdx;
@@ -354,6 +362,20 @@ int PitchTrimDownCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, 
 	return 1; // Return 1 to let other plugins also handle the command
 }
 
+
+// Command handler function
+int CWSCommandHndler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	std::lock_guard<std::mutex> lock(dataMutex);
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		CWSActive = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		CWSActive = false;
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
 // ******************** END OF TRIMWHEEL FUNCTIONS *********************//
 
 
@@ -414,8 +436,17 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 
 			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 			pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+			CWSCommand = XPLMFindCommand("sim/autopilot/control_wheel_steer");
+			PTTCommand = XPLMFindCommand("sim/operation/contact_atc");
+			//sim/fuel/fuel_selector_lft
+			//sim/fuel/fuel_selector_rgt
+			//sim/fuel/fuel_selector_none
+
+
 			autopilotDisconnectCommand = XPLMFindCommand("sim/autopilot/disconnect");
 			gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
+
+
 
 			XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 			if (pitchTrimUpCommand != nullptr) {
@@ -426,7 +457,10 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 			if (pitchTrimDownCommand != nullptr) {
 				XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
 			}
+
+
 			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+
 			XPLMRegisterFlightLoopCallback(FlightLoopCallback, -1.0f, nullptr);
 			keepRunning.store(true);
 
@@ -510,9 +544,24 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 							}
 							XPLMSetDataf(gElevTrimDataRef, trimWheelValf);
 						}
-						else if (receivedEncoderDirF == 2) {
+						else if (receivedEncoderDirF == 2) { // ap disc
 							triggerAPDisc.store(true);
 
+						}
+						else if (receivedEncoderDirF == 3) { // CWS Press
+							if (CWSCommand != nullptr) {
+								XPLMCommandBegin(CWSCommand);
+							}
+						}
+						else if (receivedEncoderDirF == 4) { // CWS Depress
+							if (CWSCommand != nullptr) {
+								XPLMCommandEnd(CWSCommand);
+							}
+						}
+						else if (receivedEncoderDirF == 5) { // PTT Toggle
+							if (PTTCommand != nullptr) {
+								XPLMCommandOnce(PTTCommand);
+							}
 						}
 
 					}
@@ -537,6 +586,11 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 
 		if (fuelSelectorActive) {
 
+			LeftFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_lft");
+			RightFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_rgt");
+			OffFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_none");
+			ShiftFuelSelectorCommand = XPLMFindCommand("tbm900/actuators/fuel/shift");
+
 			gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
 			gFuelModeDataRef = XPLMFindDataRef("tbm900/switches/fuel/auto_man");
 
@@ -557,7 +611,39 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 					{
 						currFuelSelectorPosition = XPLMGetDataf(gFuelSelectorDataRef);
 					}
+					if (receivedDataFS != "") {
+						int receivedFSDir = std::stof(receivedDataFS);
+						std::ostringstream oss;
+						oss << "Received: " << receivedFSDir << std::endl;
+						XPLMDebugString(oss.str().c_str());
+						if (receivedFSDir == 1) { // RIGHT
+							if (RightFuelSelectorCommand != nullptr) {
+								XPLMCommandOnce(RightFuelSelectorCommand);
+							}
+						}
+						else if (receivedFSDir == 2) { // LEFT
+							if (LeftFuelSelectorCommand != nullptr) {
+								XPLMCommandOnce(LeftFuelSelectorCommand);
+							}
 
+						}
+						else if (receivedFSDir == 3) { // OFF
+							if (OffFuelSelectorCommand != nullptr) {
+								XPLMCommandOnce(OffFuelSelectorCommand);
+							}
+						}
+						else if (receivedFSDir == 4) { // SHIFT
+							if (ShiftFuelSelectorCommand != nullptr) {
+								XPLMCommandBegin(ShiftFuelSelectorCommand); // only for shift
+		
+							}
+						}
+						else if (receivedFSDir == 5) { // SHIFT
+							if (ShiftFuelSelectorCommand != nullptr) {
+								XPLMCommandEnd(ShiftFuelSelectorCommand);
+							}
+						}
+					}
 				}
 
 			}
@@ -603,6 +689,15 @@ void serialCommsThreadFS() {
 					}
 					prevFuelMode = fuelMode;
 				}
+
+				// FUEL SELECTOR SERIAL RECEPTION
+				if (fuelSelectorSerial.available()) {
+					receivedDataFS = fuelSelectorSerial.read(fuelSelectorSerial.available());
+				}
+				else {
+					receivedDataFS = "";
+				}
+
 
 				float fuelSelectorPos = currFuelSelectorPosition;
 				if (fuelSelectorPos != prevFuelSelectorPosition) {
