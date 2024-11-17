@@ -55,7 +55,9 @@ std::mutex dataRefMutex;
 std::mutex dataMutex, dataMutexTW;
 serial::Serial fuelSelectorSerial;
 std::atomic<bool> keepRunningFuelSelector(true);
-
+int prevReceivedFSDir = 0;
+bool crashBarUp = false;
+bool hasSentStepperOff = false;
 // SHARED DATA
 std::string receivedData;
 std::string receivedDataFS;
@@ -92,6 +94,7 @@ static XPLMDataRef		gDataRef = NULL;
 static XPLMDataRef		gDataRefTBM = NULL;
 static XPLMDataRef		gDataRefTBMPitchUpSwitch = NULL;
 static XPLMDataRef		gDataRefTBMPitchDownSwitch = NULL;
+static XPLMDataRef		gDataRefCrashBar = NULL;
 
 XPLMCommandRef pitchTrimUpCommand;
 XPLMCommandRef pitchTrimDownCommand;
@@ -420,7 +423,30 @@ int fuelOffCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* 
 	}
 	return 1; // Return 1 to let other plugins also handle the command
 }
+//tbm900/actuators/elec/emerg_handle_up
+//tbm900/actuators/elec/emerg_handle_down
+int crashBarUpCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		crashBarUp = true;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
+		
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
+int crashBarDownCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, void* refcon) {
+	if (phase == xplm_CommandBegin) {
+		// Command has started (button pressed)
+		crashBarUp = false;
+	}
+	else if (phase == xplm_CommandEnd) {
+		// Command has ended (button released)
 
+	}
+	return 1; // Return 1 to let other plugins also handle the command
+}
 
 
 float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastFlightLoop, int inCounter, void* inRefcon) {
@@ -458,7 +484,28 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 				XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
 			}
 
+			XPLMCommandRef crashBarUpCommand = XPLMFindCommand("tbm900/actuators/elec/emerg_handle_up");
+			if (crashBarUpCommand != nullptr) {
+				XPLMRegisterCommandHandler(crashBarUpCommand, crashBarUpCommandHandler, 1, nullptr);
+			}
 
+			XPLMCommandRef crashBarDownCommand = XPLMFindCommand("tbm900/actuators/elec/emerg_handle_down");
+			if (crashBarDownCommand != nullptr) {
+				XPLMRegisterCommandHandler(crashBarDownCommand, crashBarDownCommandHandler, 1, nullptr);
+			}
+
+			gDataRefCrashBar = XPLMFindDataRef("tbm900/switches/elec/emerg_handle_raw");
+
+			if (gDataRefCrashBar != NULL) {
+				int crashBarStatus = XPLMGetDatai(gDataRefCrashBar);
+				if (crashBarStatus == 0) {
+					crashBarUp = true;
+				}
+				else {
+					crashBarUp = false;
+				}
+			}
+			
 			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
 
 			XPLMRegisterFlightLoopCallback(FlightLoopCallback, -1.0f, nullptr);
@@ -467,6 +514,7 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 			std::thread(serialCommsThreadFS).detach();
 			fuelSelectorActive = true;
 			trimWheelActive = true;
+			prevFuelMode = -1;
 			prevState = -1;
 		}
 
@@ -585,7 +633,7 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 		}
 
 		if (fuelSelectorActive) {
-
+			hasSentStepperOff = false; // 
 			LeftFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_lft");
 			RightFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_rgt");
 			OffFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_none");
@@ -594,7 +642,7 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 			gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
 			gFuelModeDataRef = XPLMFindDataRef("tbm900/switches/fuel/auto_man");
 
-			if (gFuelSelectorDataRef != NULL && gFuelModeDataRef != NULL) {
+			if (gFuelSelectorDataRef != NULL && gFuelModeDataRef != NULL && crashBarUp) {
 
 					if (gFuelSelectorDataRef != NULL) {
 						std::ostringstream oss;
@@ -607,10 +655,12 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 
 			try {
 				if (userAircraft == "TBM900.acf") {
-					if (gFuelSelectorDataRef != NULL)
+
+					if (gFuelSelectorDataRef != NULL && crashBarUp)
 					{
 						currFuelSelectorPosition = XPLMGetDataf(gFuelSelectorDataRef);
 					}
+
 					if (receivedDataFS != "") {
 						int receivedFSDir = std::stof(receivedDataFS);
 						std::ostringstream oss;
@@ -633,15 +683,16 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 							}
 						}
 						else if (receivedFSDir == 4) { // SHIFT
-							if (ShiftFuelSelectorCommand != nullptr) {
+							if (ShiftFuelSelectorCommand != nullptr && prevReceivedFSDir != receivedFSDir) {
 								XPLMCommandBegin(ShiftFuelSelectorCommand); // only for shift
-		
 							}
+							prevReceivedFSDir = receivedFSDir;
 						}
 						else if (receivedFSDir == 5) { // SHIFT
-							if (ShiftFuelSelectorCommand != nullptr) {
+							if (ShiftFuelSelectorCommand != nullptr && prevReceivedFSDir != receivedFSDir) {
 								XPLMCommandEnd(ShiftFuelSelectorCommand);
 							}
+							prevReceivedFSDir = receivedFSDir;
 						}
 					}
 				}
@@ -659,6 +710,8 @@ float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastF
 }
 
 void serialCommsThreadFS() {
+	
+
 	while (keepRunning.load()) {
 		
 		// TRIMWHEEL SERIAL RECEPTION
@@ -668,27 +721,30 @@ void serialCommsThreadFS() {
 		if (fuelSelectorSerial.isOpen()) {
 			std::lock_guard<std::mutex> lock(dataMutex);
 			if (fuelSelectorActive) {
-				int fuelMode = currentFuelMode;
-				if (fuelMode != prevFuelMode) {
-					if (fuelMode == 0) {
-						std::ostringstream oss;
-						oss << "R";
-						std::string fuelModeStr = oss.str();
-						fuelModeStr.append("\n");
-						//XPLMDebugString(fuelModeStr.c_str());
-						fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Auto Trigger
-						prevFuelSelectorPosition = 1.0;
+				if (crashBarUp) {
+					int fuelMode = currentFuelMode;
+					if (fuelMode != prevFuelMode) {
+						if (fuelMode == 0) {
+							std::ostringstream oss;
+							oss << "R";
+							std::string fuelModeStr = oss.str();
+							fuelModeStr.append("\n");
+							//XPLMDebugString(fuelModeStr.c_str());
+							fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Auto Trigger
+							prevFuelSelectorPosition = 1.0;
+						}
+						else if (fuelMode == 1) {
+							std::ostringstream oss;
+							oss << "T";
+							std::string fuelModeStr = oss.str();
+							fuelModeStr.append("\n");
+							//XPLMDebugString(fuelModeStr.c_str());
+							fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Manual Trigger
+						}
+						prevFuelMode = fuelMode;
 					}
-					else if (fuelMode == 1) {
-						std::ostringstream oss;
-						oss << "T";
-						std::string fuelModeStr = oss.str();
-						fuelModeStr.append("\n");
-						//XPLMDebugString(fuelModeStr.c_str());
-						fuelSelectorSerial.write(fuelModeStr.c_str()); // Send Manual Trigger
-					}
-					prevFuelMode = fuelMode;
 				}
+
 
 				// FUEL SELECTOR SERIAL RECEPTION
 				if (fuelSelectorSerial.available()) {
@@ -698,20 +754,35 @@ void serialCommsThreadFS() {
 					receivedDataFS = "";
 				}
 
-
-				float fuelSelectorPos = currFuelSelectorPosition;
-				if (fuelSelectorPos != prevFuelSelectorPosition) {
-					std::ostringstream oss;
-					oss << fuelSelectorPos;
-					std::string fuelSelectorPositionInVal = oss.str();
-					fuelSelectorPositionInVal.append("\n");
-					//XPLMDebugString(fuelSelectorPositionInVal.c_str());
-					fuelSelectorSerial.write(fuelSelectorPositionInVal.c_str()); // Send Manual Trigger
-					prevFuelSelectorPosition = fuelSelectorPos;
+				if (crashBarUp) {
+					float fuelSelectorPos = currFuelSelectorPosition;
+					if (fuelSelectorPos != prevFuelSelectorPosition) {
+						std::ostringstream oss;
+						oss << fuelSelectorPos;
+						std::string fuelSelectorPositionInVal = oss.str();
+						fuelSelectorPositionInVal.append("\n");
+						//XPLMDebugString(fuelSelectorPositionInVal.c_str());
+						fuelSelectorSerial.write(fuelSelectorPositionInVal.c_str()); // Send Manual Trigger
+						prevFuelSelectorPosition = fuelSelectorPos;
+					}
 				}
+
+
+
 				
 			}
+			if (!crashBarUp && !hasSentStepperOff) {
+				std::ostringstream oss;
+				oss << "T";
+				std::string fuelModeStr = oss.str();
+				fuelModeStr.append("\n");
+				//XPLMDebugString(fuelModeStr.c_str());
+				fuelSelectorSerial.write(fuelModeStr.c_str()); // Send DISENGAGE command
+				hasSentStepperOff = true;
+				prevFuelMode = -1; // reset;
+				currentFuelMode = FUEL_MANUAL;
 
+			}
 
 		}
 
@@ -1207,8 +1278,16 @@ PLUGIN_API void XPluginDisable(void)
 	//// Close serial port
 	if (fuelSelectorSerial.isOpen()) {
 		XPLMSetMenuItemName(myMenu, fsMenuIdx, "Fuel Selector [OFFLINE]", 1);
-		fuelSelectorSerial.close();
+
 		fuelSelectorActive = false;
+
+		std::ostringstream oss;
+		oss << "T";
+		std::string fuelModeStr = oss.str();
+		fuelModeStr.append("\n");
+		//XPLMDebugString(fuelModeStr.c_str());
+		fuelSelectorSerial.write(fuelModeStr.c_str()); // Send DISENGAGE command
+		fuelSelectorSerial.close();
 	}
 // END OF FUEL SELECTOR DISABLE FUNCTION
 }
@@ -1346,7 +1425,7 @@ void drawAboutWindow(XPLMWindowID inWindowID, void* inRefcon) {
 	XPLMDrawTranslucentDarkBox(left, top, right, bottom);
 
 	// Define the content of the "About Us" window
-	const char* aboutText = "Plugin by RoninDevGru";
+	const char* aboutText = "Plugin by RoninDevGru (build 1.003)";
 	float white[] = {1.0, 1.0, 1.0};
 	// Draw the text inside the window
 	XPLMDrawString(white , left + 20, top - 30, (char*)aboutText, NULL, xplmFont_Proportional);
