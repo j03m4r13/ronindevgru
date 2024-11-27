@@ -1,0 +1,41 @@
+# Build results
+bin/
+obj/
+
+# User-specific files
+*.user
+*.suo
+*.userosscache
+*.userprefs
+
+# Logs and database files
+*.log
+*.ldb
+
+# IDE-specific
+.vscode/
+.idea/
+.vs/
+
+# Output directories
+Build/
+Debug/
+Release/
+
+# NuGet Packages
+packages/
+*.nupkg
+
+# Temporary files
+*.tmp
+*.cache
+*.pdb
+*.mdb
+
+# Test results
+TestResults/
+*.trx
+*.coverage
+
+# Dotnet tooling
+.project/

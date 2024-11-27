@@ -1,13 +1,11 @@
 ﻿C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Microsoft\VC\v170\Microsoft.CppBuild.targets(517,5): warning MSB8004: Output Directory does not end with a trailing slash.  This build instance will add the slash as it is required to allow proper evaluation of the Output Directory.
   SimData.cpp
-C:\Users\joema\ronindevgru\SimData\SimData.cpp(570,30): warning C4244: 'initializing': conversion from 'float' to 'int', possible loss of data
-C:\Users\joema\ronindevgru\SimData\SimData.cpp(581,25): warning C4305: '+=': truncation from 'double' to 'float'
-C:\Users\joema\ronindevgru\SimData\SimData.cpp(589,25): warning C4305: '-=': truncation from 'double' to 'float'
-C:\Users\joema\ronindevgru\SimData\SimData.cpp(652,25): warning C4244: '=': conversion from 'int' to 'float', possible loss of data
-C:\Users\joema\ronindevgru\SimData\SimData.cpp(665,25): warning C4244: 'initializing': conversion from 'float' to 'int', possible loss of data
-C:\Users\joema\ronindevgru\SimData\SimData.cpp(725,19): warning C4244: 'initializing': conversion from 'float' to 'int', possible loss of data
-C:\Users\joema\ronindevgru\SimData\SimData.cpp(744,22): warning C4244: '=': conversion from 'int' to 'float', possible loss of data
-C:\Users\joema\ronindevgru\SimData\SimData.cpp(911,25): warning C4305: 'initializing': truncation from 'double' to 'float'
+C:\Users\joema\roninplugin\ronindevgru\SimData\SimData.cpp(592,29): warning C4244: 'initializing': conversion from 'float' to 'int', possible loss of data
+C:\Users\joema\roninplugin\ronindevgru\SimData\SimData.cpp(684,23): warning C4244: '=': conversion from 'int' to 'float', possible loss of data
+C:\Users\joema\roninplugin\ronindevgru\SimData\SimData.cpp(697,24): warning C4244: 'initializing': conversion from 'float' to 'int', possible loss of data
+C:\Users\joema\roninplugin\ronindevgru\SimData\SimData.cpp(757,19): warning C4244: 'initializing': conversion from 'float' to 'int', possible loss of data
+C:\Users\joema\roninplugin\ronindevgru\SimData\SimData.cpp(776,22): warning C4244: '=': conversion from 'int' to 'float', possible loss of data
+C:\Users\joema\roninplugin\ronindevgru\SimData\SimData.cpp(943,25): warning C4305: 'initializing': truncation from 'double' to 'float'
   serial.lib(serial.obj) : MSIL .netmodule or module compiled with /GL found; restarting link with /LTCG; add /LTCG to the link command line to improve linker performance
      Creating library .\Release\64\SimData.lib and object .\Release\64\SimData.exp
   Generating code

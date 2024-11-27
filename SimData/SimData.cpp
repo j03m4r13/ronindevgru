@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include "XPLMDataAccess.h"
 #include "XPLMProcessing.h"
@@ -17,6 +18,8 @@
 #include <mutex>
 #include <vector>
 #include <cmath>
+#include "json.hpp"
+
 #define XPLM_MSG_PLANE_LOADED 102
 #define TW_PLUGIN 1
 #define FS_PLUGIN 2
@@ -49,6 +52,9 @@
 //sim/fuel/fuel_selector_lft
 //sim/fuel/fuel_selector_rgt
 //sim/fuel/fuel_selector_none
+// 
+using json = nlohmann::json;
+float elevatorTrimValue;
 //************************************
 // FUEL SELECTOR DEFINITIONS
 std::mutex dataRefMutex;
@@ -158,6 +164,25 @@ HANDLE hSerial;
 DCB dcbSerialParams = { 0 };
 COMMTIMEOUTS timeouts = { 0 };
 
+float readElevatorTrimFromConfig(const std::string& configPath) {
+	std::ifstream configFile(configPath);
+	if (!configFile.is_open()) {
+		std::cerr << "Error: Could not open config file: " << configPath << std::endl;
+		return 0.0025f; // Default value in case of error
+	}
+
+	json config;
+	configFile >> config;
+
+	// Access the "elevator_trim" value from the JSON
+	if (config.contains("elevator_trim_inc") && config["elevator_trim_inc"].is_number()) {
+		return config["elevator_trim_inc"].get<float>();
+	}
+	else {
+		std::cerr << "Error: Invalid or missing 'elevator_trim' in config file" << std::endl;
+		return 0.0025f; // Default value in case of error
+	}
+}
 
 
 std::vector<std::string> list_ports() {
@@ -187,12 +212,9 @@ std::string enumerate_ports(int forPlugin = TW_PLUGIN)
 		if (forPlugin == TW_PLUGIN) {
 			if (device.hardware_id.find("VID_1A86&PID_7523&REV_0264") != std::string::npos ||
 				device.hardware_id.find("VID_2310&PID_8008") != std::string::npos ||
-				device.hardware_id.find("VID_2341&PID_8037") != std::string::npos ||
-				device.hardware_id.find("VID_2341&PID_8036") != std::string::npos ||
-				device.hardware_id.find("VID_2341&PID_8037") != std::string::npos ||
 				device.hardware_id.find("VID_4210&PID_6900") != std::string::npos ||
 				device.hardware_id.find("VID_2342&PID_3501") != std::string::npos ||
-				device.hardware_id.find("VID_4262PID_3500") != std::string::npos) {
+				device.hardware_id.find("VID_4262&PID_3500") != std::string::npos) {
 
 
 				oss << "[RoninDevGru] Found Arduino Micro for the TrimWheel Module: " << device.port.c_str() << std::endl;
@@ -249,7 +271,7 @@ bool isInFlight() {
 			return true;
 		}
 	}
-	
+
 	return false;
 }
 
@@ -432,7 +454,7 @@ int crashBarUpCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, voi
 	}
 	else if (phase == xplm_CommandEnd) {
 		// Command has ended (button released)
-		
+
 	}
 	return 1; // Return 1 to let other plugins also handle the command
 }
@@ -451,269 +473,279 @@ int crashBarDownCommandHandler(XPLMCommandRef command, XPLMCommandPhase phase, v
 
 float MainFlightLoop(float inElapsedSinceLastCall, float inElapsedTimeSinceLastFlightLoop, int inCounter, void* inRefcon) {
 
-		std::lock_guard<std::mutex> lock(dataMutex);
-		if (!hasLoadedAircraftName) {
+	std::lock_guard<std::mutex> lock(dataMutex);
+	if (!hasLoadedAircraftName) {
 
-			if (userAircraft.empty()) {
-				userAircraft = getFirstAircraftModel();
-			}
-
-			hasLoadedAircraftName = true;
-
-			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
-			pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
-			CWSCommand = XPLMFindCommand("sim/autopilot/control_wheel_steer");
-			PTTCommand = XPLMFindCommand("sim/operation/contact_atc");
-			//sim/fuel/fuel_selector_lft
-			//sim/fuel/fuel_selector_rgt
-			//sim/fuel/fuel_selector_none
-
-
-			autopilotDisconnectCommand = XPLMFindCommand("sim/autopilot/disconnect");
-			gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
-
-
-
-			XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
-			if (pitchTrimUpCommand != nullptr) {
-				XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
-			}
-
-			XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
-			if (pitchTrimDownCommand != nullptr) {
-				XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
-			}
-
-			XPLMCommandRef crashBarUpCommand = XPLMFindCommand("tbm900/actuators/elec/emerg_handle_up");
-			if (crashBarUpCommand != nullptr) {
-				XPLMRegisterCommandHandler(crashBarUpCommand, crashBarUpCommandHandler, 1, nullptr);
-			}
-
-			XPLMCommandRef crashBarDownCommand = XPLMFindCommand("tbm900/actuators/elec/emerg_handle_down");
-			if (crashBarDownCommand != nullptr) {
-				XPLMRegisterCommandHandler(crashBarDownCommand, crashBarDownCommandHandler, 1, nullptr);
-			}
-
-			gDataRefCrashBar = XPLMFindDataRef("tbm900/switches/elec/emerg_handle_raw");
-
-			if (gDataRefCrashBar != NULL) {
-				int crashBarStatus = XPLMGetDatai(gDataRefCrashBar);
-				if (crashBarStatus == 0) {
-					crashBarUp = true;
-				}
-				else {
-					crashBarUp = false;
-				}
-			}
-			
-			pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
-
-			XPLMRegisterFlightLoopCallback(FlightLoopCallback, -1.0f, nullptr);
-			keepRunning.store(true);
-
-			std::thread(serialCommsThreadFS).detach();
-			fuelSelectorActive = true;
-			trimWheelActive = true;
-			prevFuelMode = -1;
-			prevState = -1;
+		if (userAircraft.empty()) {
+			userAircraft = getFirstAircraftModel();
 		}
 
+		hasLoadedAircraftName = true;
 
-		if (trimWheelActive) {
-			try {
-				if (hasLoadedAircraftName && userAircraft == "TBM900.acf") {
+		pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+		pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+		CWSCommand = XPLMFindCommand("sim/autopilot/control_wheel_steer");
+		PTTCommand = XPLMFindCommand("sim/operation/contact_atc");
+		//sim/fuel/fuel_selector_lft
+		//sim/fuel/fuel_selector_rgt
+		//sim/fuel/fuel_selector_none
 
-					gDataRefTBM = XPLMFindDataRef("tbm900/switches/elec/ap_trims_raw");
-					gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
 
-					int tbmTrimMode = XPLMGetDatai(gDataRefTBM);
-					int apModeTBM = XPLMGetDatai(gDataRef);
-					int currentState = -1;
+		autopilotDisconnectCommand = XPLMFindCommand("sim/autopilot/disconnect");
+		gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
 
-					if (tbmTrimMode == TBM_STATE_TRIM_OFF) {
-						currentTBMTrimState = TBM_STATE_TRIM_OFF; // save current state;
-					}
-					else if (tbmTrimMode == TBM_STATE_TRIM_ON) {
-						currentTBMTrimState = TBM_STATE_TRIM_ON; // save current state;
-					}
 
-					if (apModeTBM == TBM_AP_ON) {
-						currentTBMTrimState = TBM_STATE_AUTOPILOT_ON; // save current state;
-						autoPilotDisconnected = false;
-					}
 
-					if (pitchTrimDownActive || pitchTrimUpActive) {
-						currentTBMTrimState = TBM_STATE_TRIM_ON_MANUAL_PITCH_ON; // 
-					}
+		XPLMCommandRef pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+		if (pitchTrimUpCommand != nullptr) {
+			XPLMRegisterCommandHandler(pitchTrimUpCommand, PitchTrimUpCommandHandler, 1, nullptr);
+		}
 
+		XPLMCommandRef pitchTrimDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+		if (pitchTrimDownCommand != nullptr) {
+			XPLMRegisterCommandHandler(pitchTrimDownCommand, PitchTrimDownCommandHandler, 1, nullptr);
+		}
+
+		XPLMCommandRef crashBarUpCommand = XPLMFindCommand("tbm900/actuators/elec/emerg_handle_up");
+		if (crashBarUpCommand != nullptr) {
+			XPLMRegisterCommandHandler(crashBarUpCommand, crashBarUpCommandHandler, 1, nullptr);
+		}
+
+		XPLMCommandRef crashBarDownCommand = XPLMFindCommand("tbm900/actuators/elec/emerg_handle_down");
+		if (crashBarDownCommand != nullptr) {
+			XPLMRegisterCommandHandler(crashBarDownCommand, crashBarDownCommandHandler, 1, nullptr);
+		}
+
+		gDataRefCrashBar = XPLMFindDataRef("tbm900/switches/elec/emerg_handle_raw");
+
+		if (gDataRefCrashBar != NULL) {
+			int crashBarStatus = XPLMGetDatai(gDataRefCrashBar);
+			if (crashBarStatus == 0) {
+				crashBarUp = true;
+			}
+			else {
+				crashBarUp = false;
+			}
+		}
+
+		pitchTrimUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+
+		XPLMRegisterFlightLoopCallback(FlightLoopCallback, -1.0f, nullptr);
+		keepRunning.store(true);
+
+		std::thread(serialCommsThreadFS).detach();
+		fuelSelectorActive = true;
+		trimWheelActive = true;
+		prevFuelMode = -1;
+		prevState = -1;
+	}
+
+
+	if (trimWheelActive) {
+		try {
+			if (hasLoadedAircraftName && userAircraft == "TBM900.acf") {
+
+				gDataRefTBM = XPLMFindDataRef("tbm900/switches/elec/ap_trims_raw");
+				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
+
+				int tbmTrimMode = XPLMGetDatai(gDataRefTBM);
+				int apModeTBM = XPLMGetDatai(gDataRef);
+				int currentState = -1;
+
+				if (tbmTrimMode == TBM_STATE_TRIM_OFF) {
+					currentTBMTrimState = TBM_STATE_TRIM_OFF; // save current state;
 				}
-				else {
-
-					gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
-					if (gDataRef != NULL)
-					{
-						
-						currAutoPilotMode = XPLMGetDatai(gDataRef);
-
-						if (pitchTrimDownActive || pitchTrimUpActive) {
-							currAutoPilotMode = YOKE_TRIM_MODE;
-						}
-						
-					}
-					else {
-						std::cerr << "Failed to send data to COM port" << std::endl;
-					}
-
-				}
-
-				if (receivedData != "") {
-					int receivedEncoderDirF = std::stof(receivedData);
-					std::ostringstream oss;
-					oss << "Received: " << receivedData << std::endl;
-					std::string rxData = oss.str();
-
-					XPLMDataRef gElevTrimDataRef = XPLMFindDataRef("sim/cockpit2/controls/elevator_trim");
-					if (gElevTrimDataRef != NULL)
-					{
-						std::ostringstream oss3;
-						float trimWheelValf = XPLMGetDataf(gElevTrimDataRef);
-						if (receivedEncoderDirF == 1) {
-							trimWheelValf += 0.0025;
-							if (trimWheelValf > 1.0) {
-								trimWheelValf = 1.0;
-							}
-							XPLMSetDataf(gElevTrimDataRef, trimWheelValf);
-						}
-						else if (receivedEncoderDirF == -1) {
-
-							trimWheelValf -= 0.0025;
-							if (trimWheelValf < -1.0) {
-								trimWheelValf = -1.0;
-							}
-							XPLMSetDataf(gElevTrimDataRef, trimWheelValf);
-						}
-						else if (receivedEncoderDirF == 2) { // ap disc
-							triggerAPDisc.store(true);
-
-						}
-						else if (receivedEncoderDirF == 3) { // CWS Press
-							if (CWSCommand != nullptr) {
-								XPLMCommandBegin(CWSCommand);
-							}
-						}
-						else if (receivedEncoderDirF == 4) { // CWS Depress
-							if (CWSCommand != nullptr) {
-								XPLMCommandEnd(CWSCommand);
-							}
-						}
-						else if (receivedEncoderDirF == 5) { // PTT Toggle
-							if (PTTCommand != nullptr) {
-								XPLMCommandOnce(PTTCommand);
-							}
-						}
-
-					}
-
-
+				else if (tbmTrimMode == TBM_STATE_TRIM_ON) {
+					currentTBMTrimState = TBM_STATE_TRIM_ON; // save current state;
 				}
 
-				gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
+				if (apModeTBM == TBM_AP_ON) {
+					currentTBMTrimState = TBM_STATE_AUTOPILOT_ON; // save current state;
+					autoPilotDisconnected = false;
+				}
+
+				if (pitchTrimDownActive || pitchTrimUpActive) {
+					currentTBMTrimState = TBM_STATE_TRIM_ON_MANUAL_PITCH_ON; // 
+				}
+
+			}
+			else {
+
+				gDataRef = XPLMFindDataRef("sim/cockpit/autopilot/autopilot_mode");
 				if (gDataRef != NULL)
 				{
-					currTrimDown = XPLMGetDataf(gDataRef);
+
+					currAutoPilotMode = XPLMGetDatai(gDataRef);
+
+					if (pitchTrimDownActive || pitchTrimUpActive) {
+						currAutoPilotMode = YOKE_TRIM_MODE;
+					}
+
+				}
+				else {
+					std::cerr << "Failed to send data to COM port" << std::endl;
 				}
 
 			}
-			catch (serial::IOException& e) {
+
+			if (receivedData != "") {
+				int receivedEncoderDirF = std::stof(receivedData);
 				std::ostringstream oss;
-				oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
-				XPLMDebugString(oss.str().c_str());
-			}
-
-		}
-
-		if (fuelSelectorActive) {
-			hasSentStepperOff = false; // 
-			LeftFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_lft");
-			RightFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_rgt");
-			OffFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_none");
-			ShiftFuelSelectorCommand = XPLMFindCommand("tbm900/actuators/fuel/shift");
-
-			gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
-			gFuelModeDataRef = XPLMFindDataRef("tbm900/switches/fuel/auto_man");
-
-			if (gFuelSelectorDataRef != NULL && gFuelModeDataRef != NULL && crashBarUp) {
-
-					if (gFuelSelectorDataRef != NULL) {
-						std::ostringstream oss;
-
-						int fuelMode = XPLMGetDatai(gFuelModeDataRef);
-				
-						currentFuelMode = fuelMode;	
+				oss << "Received: " << receivedData << std::endl;
+				std::string rxData = oss.str();
+				//XPLMDebugString(oss.str().c_str());
+				XPLMDataRef gElevTrimDataRef = XPLMFindDataRef("sim/cockpit2/controls/elevator_trim");
+				if (gElevTrimDataRef != NULL)
+				{
+					std::ostringstream oss3;
+					float trimWheelValf = XPLMGetDataf(gElevTrimDataRef);
+					if (receivedEncoderDirF == 1) {
+						//sim / flight_controls / pitch_trim_down
+						//XPLMCommandRef pitchDownCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_down");
+						//if (pitchDownCommand != nullptr) {
+						//	XPLMCommandBegin(pitchDownCommand);
+						//	XPLMCommandEnd(pitchDownCommand);
+						//}
+						trimWheelValf += elevatorTrimValue;
+						if (trimWheelValf > 1.0) {
+							trimWheelValf = 1.0;
+						}
+						XPLMSetDataf(gElevTrimDataRef, trimWheelValf);
 					}
-			}
-
-			try {
-				if (userAircraft == "TBM900.acf") {
-
-					if (gFuelSelectorDataRef != NULL && crashBarUp)
-					{
-						currFuelSelectorPosition = XPLMGetDataf(gFuelSelectorDataRef);
+					else if (receivedEncoderDirF == -1) {
+						//XPLMCommandRef pitchUpCommand = XPLMFindCommand("sim/flight_controls/pitch_trim_up");
+						//if (pitchUpCommand != nullptr) {
+						//	XPLMCommandBegin(pitchUpCommand);
+						//	XPLMCommandEnd(pitchUpCommand);
+						//}
+						trimWheelValf -= elevatorTrimValue;
+						if (trimWheelValf < -1.0) {
+							trimWheelValf = -1.0;
+						}
+						XPLMSetDataf(gElevTrimDataRef, trimWheelValf);
 					}
+					else if (receivedEncoderDirF == 2) { // ap disc
+						triggerAPDisc.store(true);
 
-					if (receivedDataFS != "") {
-						int receivedFSDir = std::stof(receivedDataFS);
-						std::ostringstream oss;
-						oss << "Received: " << receivedFSDir << std::endl;
-						XPLMDebugString(oss.str().c_str());
-						if (receivedFSDir == 1) { // RIGHT
-							if (RightFuelSelectorCommand != nullptr) {
-								XPLMCommandOnce(RightFuelSelectorCommand);
-							}
-						}
-						else if (receivedFSDir == 2) { // LEFT
-							if (LeftFuelSelectorCommand != nullptr) {
-								XPLMCommandOnce(LeftFuelSelectorCommand);
-							}
-
-						}
-						else if (receivedFSDir == 3) { // OFF
-							if (OffFuelSelectorCommand != nullptr) {
-								XPLMCommandOnce(OffFuelSelectorCommand);
-							}
-						}
-						else if (receivedFSDir == 4) { // SHIFT
-							if (ShiftFuelSelectorCommand != nullptr && prevReceivedFSDir != receivedFSDir) {
-								XPLMCommandBegin(ShiftFuelSelectorCommand); // only for shift
-							}
-							prevReceivedFSDir = receivedFSDir;
-						}
-						else if (receivedFSDir == 5) { // SHIFT
-							if (ShiftFuelSelectorCommand != nullptr && prevReceivedFSDir != receivedFSDir) {
-								XPLMCommandEnd(ShiftFuelSelectorCommand);
-							}
-							prevReceivedFSDir = receivedFSDir;
+					}
+					else if (receivedEncoderDirF == 3) { // CWS Press
+						if (CWSCommand != nullptr) {
+							XPLMCommandBegin(CWSCommand);
 						}
 					}
+					else if (receivedEncoderDirF == 4) { // CWS Depress
+						if (CWSCommand != nullptr) {
+							XPLMCommandEnd(CWSCommand);
+						}
+					}
+					else if (receivedEncoderDirF == 5) { // PTT Toggle
+						if (PTTCommand != nullptr) {
+							XPLMCommandOnce(PTTCommand);
+						}
+					}
+
 				}
 
+
 			}
-			catch (serial::IOException& e) {
+
+			gDataRef = XPLMFindDataRef("sim/flightmodel/controls/elv_trim");
+			if (gDataRef != NULL)
+			{
+				currTrimDown = XPLMGetDataf(gDataRef);
+			}
+
+		}
+		catch (serial::IOException& e) {
+			std::ostringstream oss;
+			oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
+			XPLMDebugString(oss.str().c_str());
+		}
+
+	}
+
+	if (fuelSelectorActive) {
+		hasSentStepperOff = false; // 
+		LeftFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_lft");
+		RightFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_rgt");
+		OffFuelSelectorCommand = XPLMFindCommand("sim/fuel/fuel_selector_none");
+		ShiftFuelSelectorCommand = XPLMFindCommand("tbm900/actuators/fuel/shift");
+
+		gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
+		gFuelModeDataRef = XPLMFindDataRef("tbm900/switches/fuel/auto_man");
+
+		if (gFuelSelectorDataRef != NULL && gFuelModeDataRef != NULL && crashBarUp) {
+
+			if (gFuelSelectorDataRef != NULL) {
 				std::ostringstream oss;
-				oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
-				XPLMDebugString(oss.str().c_str());
+
+				int fuelMode = XPLMGetDatai(gFuelModeDataRef);
+
+				currentFuelMode = fuelMode;
 			}
 		}
-	
+
+		try {
+			if (userAircraft == "TBM900.acf") {
+
+				if (gFuelSelectorDataRef != NULL && crashBarUp)
+				{
+					currFuelSelectorPosition = XPLMGetDataf(gFuelSelectorDataRef);
+				}
+
+				if (receivedDataFS != "") {
+					int receivedFSDir = std::stof(receivedDataFS);
+					std::ostringstream oss;
+					oss << "Received: " << receivedFSDir << std::endl;
+					XPLMDebugString(oss.str().c_str());
+					if (receivedFSDir == 1) { // RIGHT
+						if (RightFuelSelectorCommand != nullptr) {
+							XPLMCommandOnce(RightFuelSelectorCommand);
+						}
+					}
+					else if (receivedFSDir == 2) { // LEFT
+						if (LeftFuelSelectorCommand != nullptr) {
+							XPLMCommandOnce(LeftFuelSelectorCommand);
+						}
+
+					}
+					else if (receivedFSDir == 3) { // OFF
+						if (OffFuelSelectorCommand != nullptr) {
+							XPLMCommandOnce(OffFuelSelectorCommand);
+						}
+					}
+					else if (receivedFSDir == 4) { // SHIFT
+						if (ShiftFuelSelectorCommand != nullptr && prevReceivedFSDir != receivedFSDir) {
+							XPLMCommandBegin(ShiftFuelSelectorCommand); // only for shift
+						}
+						prevReceivedFSDir = receivedFSDir;
+					}
+					else if (receivedFSDir == 5) { // SHIFT
+						if (ShiftFuelSelectorCommand != nullptr && prevReceivedFSDir != receivedFSDir) {
+							XPLMCommandEnd(ShiftFuelSelectorCommand);
+						}
+						prevReceivedFSDir = receivedFSDir;
+					}
+				}
+			}
+
+		}
+		catch (serial::IOException& e) {
+			std::ostringstream oss;
+			oss << "[RoninDevGru] Error opening serial port: " << e.what() << std::endl;
+			XPLMDebugString(oss.str().c_str());
+		}
+	}
+
 
 	return -1.0f; // Return -1 to run every frame
 }
 
 void serialCommsThreadFS() {
-	
+
 
 	while (keepRunning.load()) {
-		
+
 		// TRIMWHEEL SERIAL RECEPTION
 		//std::ostringstream oss;
 		//oss << "[RoninDevGru] ALIVE FROM HERE" << std::endl;
@@ -769,7 +801,7 @@ void serialCommsThreadFS() {
 
 
 
-				
+
 			}
 			if (!crashBarUp && !hasSentStepperOff) {
 				std::ostringstream oss;
@@ -860,7 +892,7 @@ void serialCommsThreadFS() {
 
 				}
 
-				
+
 
 				// TRIMWHEEL SERIAL RECEPTION
 				if (arduinoSerial.available()) {
@@ -1079,6 +1111,12 @@ PLUGIN_API int XPluginStart(
 		1);
 
 	aboutMenuItemIndex = XPLMAppendMenuItem(myMenu, "About Us", (void*)"about", 1);
+	std::ostringstream oss;
+	oss << "[RoninDevGru] Reading config file." << std::endl;
+	XPLMDebugString(oss.str().c_str());
+	std::string configPath = "Resources/plugins/RoninDevGru/config.json";
+	// Load the elevator trim setting
+	elevatorTrimValue = readElevatorTrimFromConfig(configPath);
 
 	std::string comPort = enumerate_ports(TW_PLUGIN);  // Change this to the detected COM port number
 	prevAutoPilotMode = 0;
@@ -1106,7 +1144,7 @@ PLUGIN_API int XPluginStart(
 		}
 	}
 
-	
+
 
 	if (arduinoSerial.isOpen()) {
 
@@ -1121,7 +1159,7 @@ PLUGIN_API int XPluginStart(
 		//trimWheelActive = true;
 
 		autoPilotDisconnected = false;
-		XPLMSetMenuItemName(myMenu,twMenuIdx, "Trim Wheel [ONLINE]", 1);
+		XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [ONLINE]", 1);
 	}
 
 	/* Provide our plugin's profile to the plugin system. */
@@ -1191,7 +1229,7 @@ PLUGIN_API int XPluginStart(
 
 PLUGIN_API void	XPluginStop(void)
 {
-// ****** TRIM WHEEL RELATED GARBAGE COLLECTION ******** ////
+	// ****** TRIM WHEEL RELATED GARBAGE COLLECTION ******** ////
 	if (arduinoSerial.isOpen()) {
 		std::ostringstream oss;
 		oss << "M" << std::endl;
@@ -1225,9 +1263,9 @@ PLUGIN_API void	XPluginStop(void)
 	if (arduinoSerial.isOpen()) {
 		arduinoSerial.close();
 	}
-// END OF TRIMWHEEL GARBAGE COLLECTION
+	// END OF TRIMWHEEL GARBAGE COLLECTION
 
-// ****** FUEL SELECTOR GARBAGE COLLECTION
+	// ****** FUEL SELECTOR GARBAGE COLLECTION
 
 
 	keepRunningFuelSelector.store(false);  // Signal the thread to stop
@@ -1245,12 +1283,12 @@ PLUGIN_API void	XPluginStop(void)
 	}
 
 
-// END OF FUEL SELECTOR GARBAGE COLLECTION
+	// END OF FUEL SELECTOR GARBAGE COLLECTION
 }
 
 PLUGIN_API void XPluginDisable(void)
 {
-// TRIM WHEEL DISABLE FUNCTIONS
+	// TRIM WHEEL DISABLE FUNCTIONS
 	if (arduinoSerial.isOpen()) {
 		std::ostringstream oss;
 		oss << "M" << std::endl;
@@ -1269,8 +1307,8 @@ PLUGIN_API void XPluginDisable(void)
 		XPLMSetMenuItemName(myMenu, twMenuIdx, "Trim Wheel [OFFLINE]", 1);
 		trimWheelActive = false;
 	}
-//  END OF TRIMWHEEL DISABLE FUNCTIONS
-// FUEL SELECTOR DISABLE FUNCTION
+	//  END OF TRIMWHEEL DISABLE FUNCTIONS
+	// FUEL SELECTOR DISABLE FUNCTION
 	keepRunningFuelSelector.store(false);  // Signal the thread to stop
 
 	//// Stop the serial communication thread
@@ -1289,13 +1327,13 @@ PLUGIN_API void XPluginDisable(void)
 		fuelSelectorSerial.write(fuelModeStr.c_str()); // Send DISENGAGE command
 		fuelSelectorSerial.close();
 	}
-// END OF FUEL SELECTOR DISABLE FUNCTION
+	// END OF FUEL SELECTOR DISABLE FUNCTION
 }
 
 PLUGIN_API int XPluginEnable(void)
 {
-	
-// TRIM WHEEL ENABLE FUNCTIONS
+
+	// TRIM WHEEL ENABLE FUNCTIONS
 	std::ostringstream oss;
 	oss << "[RoninDevGru] PLUGIN ENABLED." << std::endl;
 	XPLMDebugString(oss.str().c_str());
@@ -1330,9 +1368,9 @@ PLUGIN_API int XPluginEnable(void)
 		}
 
 	}
-// END OF TRIMWHEEL ENABLE FUNCTIONS
+	// END OF TRIMWHEEL ENABLE FUNCTIONS
 
-// FUEL SELECTOR ENABLE FUNCTIONS
+	// FUEL SELECTOR ENABLE FUNCTIONS
 	if (!fuelSelectorSerial.isOpen()) {
 		std::string comPort = enumerate_ports(FS_PLUGIN);  // Change this to the detected COM port number
 
@@ -1357,7 +1395,7 @@ PLUGIN_API int XPluginEnable(void)
 				gFuelSelectorDataRef = XPLMFindDataRef("tbm900/switches/fuel/fuel_sel");
 				//std::thread(serialPollingThreadFuelSelector).detach();
 				if (gFuelSelectorDataRef != NULL) {
-					
+
 					currFuelSelectorPosition = 0.0;
 					prevFuelSelectorPosition = 0.0;
 					float fuelSelectorPositionF = XPLMGetDataf(gFuelSelectorDataRef);
@@ -1411,7 +1449,7 @@ void createAboutWindow() {
 		NULL,               // Mouse click callback for close button
 		handleMouseClick,                           // Key callback (optional)
 		NULL                          // Cursor status callback (optional)
-		
+
 	);
 }
 
@@ -1425,10 +1463,10 @@ void drawAboutWindow(XPLMWindowID inWindowID, void* inRefcon) {
 	XPLMDrawTranslucentDarkBox(left, top, right, bottom);
 
 	// Define the content of the "About Us" window
-	const char* aboutText = "Plugin by RoninDevGru (build 1.003)";
-	float white[] = {1.0, 1.0, 1.0};
+	const char* aboutText = "Plugin by RoninDevGru (build 1.004)";
+	float white[] = { 1.0, 1.0, 1.0 };
 	// Draw the text inside the window
-	XPLMDrawString(white , left + 20, top - 30, (char*)aboutText, NULL, xplmFont_Proportional);
+	XPLMDrawString(white, left + 20, top - 30, (char*)aboutText, NULL, xplmFont_Proportional);
 
 	// Draw the "Close" button as a small rectangle with text
 	const int buttonWidth = 50;
@@ -1439,7 +1477,7 @@ void drawAboutWindow(XPLMWindowID inWindowID, void* inRefcon) {
 	XPLMDrawTranslucentDarkBox(buttonLeft, buttonBottom + buttonHeight, buttonLeft + buttonWidth, buttonBottom);
 
 	// Draw "Close" text on the button
-	
+
 	XPLMDrawString(white, buttonLeft + 5, buttonBottom + 5, (char*)"Close", NULL, xplmFont_Proportional);
 }
 
